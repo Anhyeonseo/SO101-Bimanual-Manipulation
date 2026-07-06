@@ -1,0 +1,47 @@
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Colcon
+.colcon/
+.DS_Store
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Large model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+# Videos / large media
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Logs
+*.log
+rosbag2_*/
+
+# Temporary
+tmp/
+temp/
