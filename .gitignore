@@ -1,47 +1,49 @@
-# ROS2 build artifacts
+# ROS 2 / colcon
 build/
 install/
 log/
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Colcon
-.colcon/
-.DS_Store
-
-# VS Code
-.vscode/
-*.code-workspace
-
-# Python environments
+*.py[cod]
 .venv/
-venv/
-env/
+.venv-*/
 
-# Large model files
-*.pt
-*.pth
-*.onnx
-*.engine
-*.tflite
+# C/C++ / STM32
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.cyclo
+Debug/
+Release/
+cmake-build-*/
+compile_commands.json
 
-# Videos / large media
-*.mp4
-*.mov
-*.avi
-*.mkv
-
-# Logs
+# Editors and OS
+.vscode/
+.idea/
+.metadata/
+.codex/
+.agents/
+*.launch
 *.log
-rosbag2_*/
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
 
-# Temporary
-tmp/
-temp/
+# Runtime data and large artifacts
+*.bag
+*.db3
+*.mcap
+*.onnx
+datasets/
+artifacts/
+benchmark/results/raw/

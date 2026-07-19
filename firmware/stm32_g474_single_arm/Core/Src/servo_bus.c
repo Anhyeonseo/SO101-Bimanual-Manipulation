@@ -1,0 +1,798 @@
+#include "servo_bus.h"
+
+#include <stddef.h>
+
+static UART_HandleTypeDef *servo_uart_handle = NULL;
+static ServoStopRequestedFn servo_stop_requested = NULL;
+static ServoReadFailureFn servo_read_failure = NULL;
+
+const ServoJointConfig servo_joints[SINGLE_ARM_JOINT_COUNT] = {
+    {1U, "BASE",        1U, 2048U, 2048U, 2389U, 16U,  1,  34U,  600U, 400U},
+    {2U, "SHOULDER",    1U, 2048U, 2048U, 2162U, 16U,  1,  34U, 1200U, 500U},
+    {3U, "ELBOW",       1U, 2048U, 1934U, 2048U, 24U, -1,  34U, 1000U, 400U},
+    {4U, "WRIST_FLEX",  1U, 2048U, 1934U, 2048U, 16U, -1,  34U,  800U, 300U},
+    {5U, "WRIST_ROLL",  1U, 2048U, 2048U, 2219U, 16U,  1,  34U,  500U, 250U},
+    {6U, "GRIPPER",     1U, 2048U, 1934U, 2048U, 16U, -1,  34U,  800U, 150U}
+};
+
+const uint8_t servo_joint_count = SINGLE_ARM_JOINT_COUNT;
+uint8_t servo_last_all_read_failed_id = 0U;
+
+void ServoBus_Init(
+    UART_HandleTypeDef *servo_uart,
+    ServoStopRequestedFn stop_requested,
+    ServoReadFailureFn read_failure
+)
+{
+    servo_uart_handle = servo_uart;
+    servo_stop_requested = stop_requested;
+    servo_read_failure = read_failure;
+    servo_last_all_read_failed_id = 0U;
+}
+
+static uint8_t Servo_Checksum(
+    const uint8_t *packet,
+    uint8_t last_index
+)
+{
+    uint8_t sum = 0U;
+
+    for (uint8_t i = 2U; i <= last_index; i++)
+    {
+        sum = (uint8_t)(sum + packet[i]);
+    }
+
+    return (uint8_t)(~sum);
+}
+
+HAL_StatusTypeDef Servo_ReadPosition(
+    uint8_t servo_id,
+    uint16_t *position
+);
+
+HAL_StatusTypeDef Servo_ReadData(
+    uint8_t servo_id,
+    uint8_t address,
+    uint8_t data_length,
+    uint8_t *data
+);
+
+HAL_StatusTypeDef Servo_WriteData(
+    uint8_t servo_id,
+    uint8_t address,
+    const uint8_t *data,
+    uint8_t data_length
+);
+
+int32_t Servo_PositionError(
+    uint16_t actual_position,
+    uint16_t target_position
+)
+{
+    int32_t error =
+        (int32_t)actual_position -
+        (int32_t)target_position;
+
+    /* 0/4095 경계를 고려한 최단 위치 오차 */
+    if (error > 2048)
+    {
+        error -= 4096;
+    }
+    else if (error < -2048)
+    {
+        error += 4096;
+    }
+
+    return error;
+}
+
+#if ENABLE_SERVO_CENTERING_COMMAND
+HAL_StatusTypeDef Servo_CenterAtCurrentPosition(
+    uint8_t servo_id,
+    uint16_t *position_before,
+    int16_t *offset_before
+)
+{
+    if ((position_before == NULL) ||
+        (offset_before == NULL))
+    {
+        return HAL_ERROR;
+    }
+
+    uint8_t offset_data[2] = {0U};
+    uint8_t torque_off[1] = {0U};
+    uint8_t center_command[1] = {128U};
+
+    if (Servo_ReadPosition(
+            servo_id,
+            position_before
+        ) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    if (Servo_ReadData(
+            servo_id,
+            31U,
+            2U,
+            offset_data
+        ) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    *offset_before = (int16_t)(
+        (uint16_t)offset_data[0] |
+        ((uint16_t)offset_data[1] << 8)
+    );
+
+    if (Servo_WriteData(
+            servo_id,
+            40U,
+            torque_off,
+            sizeof(torque_off)
+        ) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    HAL_Delay(50U);
+
+    /*
+     * 공식 one-key centering:
+     * 현재 물리 위치를 내부 위치 2048로 보정
+     */
+    if (Servo_WriteData(
+            servo_id,
+            40U,
+            center_command,
+            sizeof(center_command)
+        ) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    HAL_Delay(500U);
+
+    /* 새 현재 위치를 목표로 넣은 뒤 토크 재활성화 */
+    return HAL_OK;
+}
+#endif
+
+HAL_StatusTypeDef Servo_WaitForPosition(
+    uint8_t servo_id,
+    uint16_t target_position,
+    uint16_t tolerance,
+    uint32_t timeout_ms,
+    uint16_t *actual_position
+)
+{
+    if (actual_position == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    uint32_t wait_start = HAL_GetTick();
+    *actual_position = 0U;
+
+    while ((HAL_GetTick() - wait_start) < timeout_ms)
+    {
+        uint16_t current_position = 0U;
+
+        if (Servo_ReadPosition(
+                servo_id,
+                &current_position
+            ) == HAL_OK)
+        {
+            *actual_position = current_position;
+
+            int32_t error = Servo_PositionError(
+                current_position,
+                target_position
+            );
+
+            if ((error >= -(int32_t)tolerance) &&
+                (error <= (int32_t)tolerance))
+            {
+                return HAL_OK;
+            }
+        }
+
+        HAL_Delay(20U);
+    }
+
+    return HAL_TIMEOUT;
+}
+
+HAL_StatusTypeDef Servo_ReadData(
+    uint8_t servo_id,
+    uint8_t start_address,
+    uint8_t data_length,
+    uint8_t *data
+)
+{
+    if ((data_length == 0U) || (data_length > 16U))
+    {
+        return HAL_ERROR;
+    }
+
+    uint8_t request[8] = {
+        0xFFU, 0xFFU, 0x00U, 0x04U,
+        0x02U, 0x00U, 0x00U, 0x00U
+    };
+
+    uint8_t reply[22] = {0U};
+
+    request[2] = servo_id;
+    request[5] = start_address;
+    request[6] = data_length;
+    request[7] = Servo_Checksum(request, 6U);
+
+    HAL_StatusTypeDef status = HAL_UART_Transmit(
+        servo_uart_handle,
+        request,
+        sizeof(request),
+        100U
+    );
+
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    uint16_t reply_length = (uint16_t)data_length + 6U;
+
+    status = HAL_UART_Receive(
+        servo_uart_handle,
+        reply,
+        reply_length,
+        100U
+    );
+
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    if ((reply[0] != 0xFFU) ||
+        (reply[1] != 0xFFU) ||
+        (reply[2] != servo_id) ||
+        (reply[3] != (uint8_t)(data_length + 2U)) ||
+        (reply[4] != 0x00U) ||
+        (reply[data_length + 5U] !=
+            Servo_Checksum(
+                reply,
+                (uint8_t)(data_length + 4U)
+            )))
+    {
+        return HAL_ERROR;
+    }
+
+    for (uint8_t i = 0U; i < data_length; i++)
+    {
+        data[i] = reply[5U + i];
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef Servo_WriteData(
+    uint8_t servo_id,
+    uint8_t start_address,
+    const uint8_t *data,
+    uint8_t data_length
+)
+{
+    if ((data_length == 0U) || (data_length > 16U))
+    {
+        return HAL_ERROR;
+    }
+
+    uint8_t packet[23] = {0U};
+    uint8_t status_reply[6] = {0U};
+
+    packet[0] = 0xFFU;
+    packet[1] = 0xFFU;
+    packet[2] = servo_id;
+    packet[3] = (uint8_t)(data_length + 3U);
+    packet[4] = 0x03U;
+    packet[5] = start_address;
+
+    for (uint8_t i = 0U; i < data_length; i++)
+    {
+        packet[6U + i] = data[i];
+    }
+
+    uint8_t checksum_index = (uint8_t)(6U + data_length);
+
+    packet[checksum_index] = Servo_Checksum(
+        packet,
+        (uint8_t)(checksum_index - 1U)
+    );
+
+    HAL_StatusTypeDef status = HAL_UART_Transmit(
+        servo_uart_handle,
+        packet,
+        (uint16_t)data_length + 7U,
+        100U
+    );
+
+    if (status == HAL_OK)
+    {
+        /* WRITE 응답이 설정된 경우 수신 버퍼에서 제거 */
+        (void)HAL_UART_Receive(
+            servo_uart_handle,
+            status_reply,
+            sizeof(status_reply),
+            2U
+        );
+    }
+
+    return status;
+}
+
+HAL_StatusTypeDef Servo_ReadPosition(
+    uint8_t servo_id,
+    uint16_t *position
+)
+{
+    uint8_t position_data[2] = {0U};
+
+    HAL_StatusTypeDef status = Servo_ReadData(
+        servo_id,
+        56U,
+        sizeof(position_data),
+        position_data
+    );
+
+    if (status == HAL_OK)
+    {
+        *position = (uint16_t)(
+            (uint16_t)position_data[0] |
+            ((uint16_t)position_data[1] << 8)
+        );
+    }
+
+    return status;
+}
+
+HAL_StatusTypeDef Servo_ReadTelemetry(
+    uint8_t servo_id,
+    uint16_t *position,
+    uint16_t *speed_raw,
+    uint16_t *load_raw,
+    uint8_t *voltage_raw,
+    uint8_t *temperature_c
+)
+{
+    uint8_t telemetry[8] = {0U};
+
+    HAL_StatusTypeDef status = Servo_ReadData(
+        servo_id,
+        56U,
+        sizeof(telemetry),
+        telemetry
+    );
+
+    if (status == HAL_OK)
+    {
+        *position = (uint16_t)(
+            (uint16_t)telemetry[0] |
+            ((uint16_t)telemetry[1] << 8)
+        );
+
+        *speed_raw = (uint16_t)(
+            (uint16_t)telemetry[2] |
+            ((uint16_t)telemetry[3] << 8)
+        );
+
+        *load_raw = (uint16_t)(
+            (uint16_t)telemetry[4] |
+            ((uint16_t)telemetry[5] << 8)
+        );
+
+        *voltage_raw = telemetry[6];
+        *temperature_c = telemetry[7];
+    }
+
+    return status;
+}
+
+static uint8_t Host_StopRequestedDuringMotion(void)
+{
+    if (servo_stop_requested == NULL)
+    {
+        return 0U;
+    }
+
+    return servo_stop_requested();
+}
+
+HAL_StatusTypeDef Servo_RunSmoothstep(
+    uint8_t servo_id,
+    uint16_t start_position,
+    uint16_t target_position,
+    uint32_t duration_ms
+)
+{
+    const uint32_t control_period_ms = 20U;
+
+    if ((duration_ms < control_period_ms) ||
+        ((duration_ms % control_period_ms) != 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    uint32_t trajectory_steps =
+        duration_ms / control_period_ms;
+
+    uint32_t denominator =
+        trajectory_steps *
+        trajectory_steps *
+        trajectory_steps;
+
+    int32_t signed_delta =
+        (int32_t)target_position -
+        (int32_t)start_position;
+
+    for (uint32_t step = 1U;
+         step <= trajectory_steps;
+         step++)
+    {
+        if (Host_StopRequestedDuringMotion() != 0U)
+        {
+            return HAL_BUSY;
+        }
+
+        uint32_t cycle_start = HAL_GetTick();
+        uint32_t step_squared = step * step;
+
+        /* Smoothstep: s(t) = 3t^2 - 2t^3 */
+        uint32_t smooth_numerator =
+            (3U * step_squared * trajectory_steps) -
+            (2U * step_squared * step);
+
+        int32_t position_offset =
+            (signed_delta *
+                (int32_t)smooth_numerator) /
+            (int32_t)denominator;
+
+        uint16_t setpoint = (uint16_t)(
+            (int32_t)start_position +
+            position_offset
+        );
+
+        uint8_t goal_data[2] = {
+            (uint8_t)(setpoint & 0xFFU),
+            (uint8_t)((setpoint >> 8) & 0xFFU)
+        };
+
+        if (Servo_WriteData(
+                servo_id,
+                42U,
+                goal_data,
+                sizeof(goal_data)
+            ) != HAL_OK)
+        {
+            return HAL_ERROR;
+        }
+
+        uint32_t elapsed =
+            HAL_GetTick() - cycle_start;
+
+        if (elapsed < control_period_ms)
+        {
+            HAL_Delay(control_period_ms - elapsed);
+        }
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef Servo_ConfigureForTrajectory(
+    uint8_t servo_id,
+    uint16_t torque_limit,
+    uint8_t p_gain,
+    uint16_t *initial_position
+)
+{
+    if (Servo_ReadPosition(
+            servo_id,
+            initial_position
+        ) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    uint8_t torque_off[1] = {0U};
+    uint8_t torque_on[1] = {1U};
+    uint8_t lock_volatile[1] = {1U};
+    uint8_t position_mode[1] = {0U};
+
+    /* 주소 순서: P, D, I */
+    uint8_t pid_data[3] = {
+        p_gain,
+        32U,
+        0U
+    };
+
+    uint8_t runtime_data[9] = {
+        0U,
+        (uint8_t)(*initial_position & 0xFFU),
+        (uint8_t)((*initial_position >> 8) & 0xFFU),
+        0U, 0U,
+        65U, 0U,
+        (uint8_t)(torque_limit & 0xFFU),
+        (uint8_t)((torque_limit >> 8) & 0xFFU)
+    };
+
+    if ((Servo_WriteData(
+            servo_id, 40U, torque_off, 1U
+        ) != HAL_OK) ||
+        (Servo_WriteData(
+            servo_id, 55U, lock_volatile, 1U
+        ) != HAL_OK) ||
+        (Servo_WriteData(
+            servo_id, 33U, position_mode, 1U
+        ) != HAL_OK) ||
+        (Servo_WriteData(
+            servo_id, 21U, pid_data, 3U
+        ) != HAL_OK) ||
+        (Servo_WriteData(
+            servo_id, 41U, runtime_data, 9U
+        ) != HAL_OK) ||
+        (Servo_WriteData(
+            servo_id, 40U, torque_on, 1U
+        ) != HAL_OK))
+    {
+        return HAL_ERROR;
+    }
+
+    HAL_Delay(20U);
+
+    uint8_t pid_readback[3] = {0U};
+
+    if ((Servo_ReadData(
+            servo_id,
+            21U,
+            sizeof(pid_readback),
+            pid_readback
+        ) != HAL_OK) ||
+        (pid_readback[0] != p_gain) ||
+        (pid_readback[1] != 32U) ||
+        (pid_readback[2] != 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef Servo_ReadAllPositions(
+    uint16_t positions[6]
+)
+{
+    if (positions == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    servo_last_all_read_failed_id = 0U;
+
+    for (uint8_t i = 0U; i < servo_joint_count; i++)
+    {
+        HAL_StatusTypeDef read_status = HAL_ERROR;
+
+        for (uint8_t attempt = 0U; attempt < 3U; attempt++)
+        {
+            HAL_Delay(10U);
+
+            read_status = Servo_ReadPosition(
+                servo_joints[i].id,
+                &positions[i]
+            );
+
+            if (read_status == HAL_OK)
+            {
+                break;
+            }
+
+            __HAL_UART_CLEAR_OREFLAG(servo_uart_handle);
+            __HAL_UART_SEND_REQ(
+                servo_uart_handle,
+                UART_RXDATA_FLUSH_REQUEST
+            );
+        }
+
+        if (read_status != HAL_OK)
+        {
+            servo_last_all_read_failed_id =
+                servo_joints[i].id;
+
+            if (servo_read_failure != NULL)
+            {
+                servo_read_failure(servo_last_all_read_failed_id);
+            }
+
+            return read_status;
+        }
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef Servo_SyncWritePositions(
+    const uint16_t positions[6]
+)
+{
+    if (positions == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    /*
+     * FEETECH protocol-0 SYNC WRITE:
+     * FF FF FE LEN 83 START_ADDR DATA_LEN [ID DATA...] CHECKSUM
+     */
+    uint8_t packet[26] = {0U};
+    uint8_t packet_index = 0U;
+
+    packet[0] = 0xFFU;
+    packet[1] = 0xFFU;
+    packet[2] = 0xFEU;
+    packet[3] = (uint8_t)(
+        4U + (servo_joint_count * 3U)
+    );
+    packet[4] = 0x83U;
+    packet[5] = 42U;
+    packet[6] = 2U;
+    packet_index = 7U;
+
+    for (uint8_t i = 0U; i < servo_joint_count; i++)
+    {
+        packet[packet_index++] = servo_joints[i].id;
+        packet[packet_index++] =
+            (uint8_t)(positions[i] & 0xFFU);
+        packet[packet_index++] =
+            (uint8_t)((positions[i] >> 8) & 0xFFU);
+    }
+
+    packet[packet_index] = Servo_Checksum(
+        packet,
+        (uint8_t)(packet_index - 1U)
+    );
+    packet_index++;
+
+    return HAL_UART_Transmit(
+        servo_uart_handle,
+        packet,
+        packet_index,
+        100U
+    );
+}
+
+HAL_StatusTypeDef Servo_ConfigureAllForTrajectory(
+    uint16_t initial_positions[6]
+)
+{
+    if (initial_positions == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    for (uint8_t i = 0U; i < servo_joint_count; i++)
+    {
+        if (Servo_ConfigureForTrajectory(
+                servo_joints[i].id,
+                servo_joints[i].torque_limit,
+                servo_joints[i].p_gain,
+                &initial_positions[i]
+            ) != HAL_OK)
+        {
+            uint8_t torque_off[1] = {0U};
+
+            for (uint8_t rollback = 0U;
+                 rollback <= i;
+                 rollback++)
+            {
+                (void)Servo_WriteData(
+                    servo_joints[rollback].id,
+                    40U,
+                    torque_off,
+                    sizeof(torque_off)
+                );
+            }
+
+            return HAL_ERROR;
+        }
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
+    const uint16_t start_positions[6],
+    const uint16_t target_positions[6],
+    uint32_t duration_ms
+)
+{
+    const uint32_t control_period_ms = 20U;
+
+    if ((start_positions == NULL) ||
+        (target_positions == NULL) ||
+        (duration_ms < control_period_ms) ||
+        ((duration_ms % control_period_ms) != 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    uint32_t trajectory_steps =
+        duration_ms / control_period_ms;
+
+    if (trajectory_steps > 100U)
+    {
+        return HAL_ERROR;
+    }
+
+    uint32_t denominator =
+        trajectory_steps *
+        trajectory_steps *
+        trajectory_steps;
+
+    for (uint32_t step = 1U;
+         step <= trajectory_steps;
+         step++)
+    {
+        if (Host_StopRequestedDuringMotion() != 0U)
+        {
+            return HAL_BUSY;
+        }
+
+        uint32_t cycle_start = HAL_GetTick();
+        uint32_t step_squared = step * step;
+        uint32_t smooth_numerator =
+            (3U * step_squared * trajectory_steps) -
+            (2U * step_squared * step);
+        uint16_t setpoints[6] = {0U};
+
+        for (uint8_t i = 0U; i < servo_joint_count; i++)
+        {
+            int32_t signed_delta =
+                (int32_t)target_positions[i] -
+                (int32_t)start_positions[i];
+
+            int32_t position_offset = (int32_t)(
+                ((int64_t)signed_delta *
+                    (int64_t)smooth_numerator) /
+                (int64_t)denominator
+            );
+
+            int32_t setpoint =
+                (int32_t)start_positions[i] +
+                position_offset;
+
+            if ((setpoint < 0) || (setpoint > 4095))
+            {
+                return HAL_ERROR;
+            }
+
+            setpoints[i] = (uint16_t)setpoint;
+        }
+
+        if (Servo_SyncWritePositions(setpoints) != HAL_OK)
+        {
+            return HAL_ERROR;
+        }
+
+        uint32_t elapsed = HAL_GetTick() - cycle_start;
+
+        if (elapsed < control_period_ms)
+        {
+            HAL_Delay(control_period_ms - elapsed);
+        }
+    }
+
+    return HAL_OK;
+}
+
+

@@ -1,0 +1,218 @@
+"""Pi-side codec for the actuator protocol v1.
+
+This module intentionally depends only on the Python standard library.  The
+serial transport is kept separate so framing and integrity checks can be unit
+tested without hardware or pyserial.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import IntEnum
+import struct
+
+
+MAGIC = 0xA55A
+VERSION = 1
+MAX_PAYLOAD = 512
+HEADER = struct.Struct("<HBBHHII")
+CRC = struct.Struct("<I")
+
+
+class MessageType(IntEnum):
+    HELLO_REQUEST = 1
+    HELLO_RESPONSE = 2
+    HEARTBEAT = 3
+    TIME_SYNC_REQUEST = 4
+    TIME_SYNC_RESPONSE = 5
+    ARM_REQUEST = 16
+    ARM_RESPONSE = 17
+    ENABLE = 18
+    HOLD = 19
+    SAFE_STOP = 20
+    DISABLE = 21
+    CLEAR_FAULT = 22
+    SETPOINT_BATCH = 32
+    SETPOINT_STATUS = 33
+    GET_STATE = 48
+    STATE_FEEDBACK = 49
+    FAULT_REPORT = 50
+    DIAGNOSTICS = 51
+
+
+KNOWN_MESSAGE_TYPES = {int(message) for message in MessageType}
+
+
+class ProtocolError(ValueError):
+    """Raised when a frame violates the wire protocol contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class Frame:
+    message_type: MessageType
+    flags: int = 0
+    sequence: int = 0
+    sender_time_ms: int = 0
+    payload: bytes = b""
+
+
+def crc32c(data: bytes) -> int:
+    """Return reflected Castagnoli CRC-32C, matching the STM32 C core."""
+
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            mask = -(crc & 1) & 0xFFFFFFFF
+            crc = ((crc >> 1) ^ (0x82F63B78 & mask)) & 0xFFFFFFFF
+    return (~crc) & 0xFFFFFFFF
+
+
+def cobs_encode(data: bytes) -> bytes:
+    output = bytearray(b"\x00")
+    code_index = 0
+    code = 1
+
+    for byte in data:
+        if byte == 0:
+            output[code_index] = code
+            code_index = len(output)
+            output.append(0)
+            code = 1
+        else:
+            output.append(byte)
+            code += 1
+            if code == 0xFF:
+                output[code_index] = code
+                code_index = len(output)
+                output.append(0)
+                code = 1
+
+    output[code_index] = code
+    return bytes(output)
+
+
+def cobs_decode(encoded: bytes) -> bytes:
+    if not encoded:
+        raise ProtocolError("empty COBS frame")
+
+    output = bytearray()
+    index = 0
+    while index < len(encoded):
+        code = encoded[index]
+        if code == 0:
+            raise ProtocolError("zero byte inside COBS frame")
+        index += 1
+
+        block_end = index + code - 1
+        if block_end > len(encoded):
+            raise ProtocolError("truncated COBS block")
+        output.extend(encoded[index:block_end])
+        index = block_end
+
+        if code != 0xFF and index < len(encoded):
+            output.append(0)
+
+    return bytes(output)
+
+
+def encode_frame(frame: Frame) -> bytes:
+    message_type = int(frame.message_type)
+    if message_type not in KNOWN_MESSAGE_TYPES:
+        raise ProtocolError(f"unknown message type: {message_type}")
+    if not 0 <= frame.flags <= 0xFFFF:
+        raise ProtocolError("flags do not fit uint16")
+    if not 0 <= frame.sequence <= 0xFFFFFFFF:
+        raise ProtocolError("sequence does not fit uint32")
+    if not 0 <= frame.sender_time_ms <= 0xFFFFFFFF:
+        raise ProtocolError("sender_time_ms does not fit uint32")
+    if len(frame.payload) > MAX_PAYLOAD:
+        raise ProtocolError("payload exceeds 512 bytes")
+
+    header = HEADER.pack(
+        MAGIC,
+        VERSION,
+        message_type,
+        frame.flags,
+        len(frame.payload),
+        frame.sequence,
+        frame.sender_time_ms,
+    )
+    decoded = header + frame.payload
+    decoded += CRC.pack(crc32c(decoded))
+    return cobs_encode(decoded) + b"\x00"
+
+
+def decode_frame(encoded_with_optional_delimiter: bytes) -> Frame:
+    encoded = encoded_with_optional_delimiter
+    if encoded.endswith(b"\x00"):
+        encoded = encoded[:-1]
+    decoded = cobs_decode(encoded)
+
+    minimum_size = HEADER.size + CRC.size
+    if len(decoded) < minimum_size:
+        raise ProtocolError("frame is shorter than header plus CRC")
+
+    magic, version, raw_type, flags, payload_length, sequence, sender_time_ms = (
+        HEADER.unpack_from(decoded)
+    )
+    if magic != MAGIC:
+        raise ProtocolError("bad magic")
+    if version != VERSION:
+        raise ProtocolError("bad protocol version")
+    if raw_type not in KNOWN_MESSAGE_TYPES:
+        raise ProtocolError("unknown message type")
+    if payload_length > MAX_PAYLOAD:
+        raise ProtocolError("payload exceeds 512 bytes")
+
+    expected_size = HEADER.size + payload_length + CRC.size
+    if len(decoded) != expected_size:
+        raise ProtocolError("payload length does not match frame length")
+
+    expected_crc = CRC.unpack_from(decoded, HEADER.size + payload_length)[0]
+    actual_crc = crc32c(decoded[: HEADER.size + payload_length])
+    if actual_crc != expected_crc:
+        raise ProtocolError("bad CRC-32C")
+
+    payload = decoded[HEADER.size : HEADER.size + payload_length]
+    return Frame(
+        message_type=MessageType(raw_type),
+        flags=flags,
+        sequence=sequence,
+        sender_time_ms=sender_time_ms,
+        payload=payload,
+    )
+
+
+class StreamDecoder:
+    """Collect a byte stream and yield validated frames at 0x00 delimiters."""
+
+    def __init__(self, maximum_encoded_size: int = 535) -> None:
+        self._buffer = bytearray()
+        self._dropping = False
+        self._maximum_encoded_size = maximum_encoded_size
+
+    def push(self, byte: int) -> Frame | None:
+        if not 0 <= byte <= 0xFF:
+            raise ValueError("byte must fit uint8")
+
+        if byte != 0:
+            if self._dropping:
+                return None
+            if len(self._buffer) >= self._maximum_encoded_size:
+                self._buffer.clear()
+                self._dropping = True
+                return None
+            self._buffer.append(byte)
+            return None
+
+        if self._dropping:
+            self._dropping = False
+            self._buffer.clear()
+            return None
+        if not self._buffer:
+            return None
+
+        encoded = bytes(self._buffer)
+        self._buffer.clear()
+        return decode_frame(encoded)

@@ -1,0 +1,104 @@
+#ifndef SERVO_BUS_H
+#define SERVO_BUS_H
+
+#include "stm32g4xx_hal.h"
+#include "single_arm_config.h"
+
+#include <stdint.h>
+
+typedef struct
+{
+    uint8_t id;
+    const char *name;
+    uint8_t motion_enabled;
+    uint16_t home_position;
+    uint16_t min_position;
+    uint16_t max_position;
+    uint8_t p_gain;
+    int8_t test_direction;
+    uint16_t test_delta;
+    uint32_t duration_ms;
+    uint16_t torque_limit;
+} ServoJointConfig;
+
+typedef uint8_t (*ServoStopRequestedFn)(void);
+typedef void (*ServoReadFailureFn)(uint8_t servo_id);
+
+extern const ServoJointConfig servo_joints[SINGLE_ARM_JOINT_COUNT];
+extern const uint8_t servo_joint_count;
+extern uint8_t servo_last_all_read_failed_id;
+
+void ServoBus_Init(
+    UART_HandleTypeDef *servo_uart,
+    ServoStopRequestedFn stop_requested,
+    ServoReadFailureFn read_failure
+);
+
+HAL_StatusTypeDef Servo_ReadPosition(
+    uint8_t servo_id,
+    uint16_t *position
+);
+HAL_StatusTypeDef Servo_ReadData(
+    uint8_t servo_id,
+    uint8_t start_address,
+    uint8_t data_length,
+    uint8_t *data
+);
+HAL_StatusTypeDef Servo_WriteData(
+    uint8_t servo_id,
+    uint8_t start_address,
+    const uint8_t *data,
+    uint8_t data_length
+);
+int32_t Servo_PositionError(
+    uint16_t actual_position,
+    uint16_t target_position
+);
+HAL_StatusTypeDef Servo_CenterAtCurrentPosition(
+    uint8_t servo_id,
+    uint16_t *position_before,
+    int16_t *offset_before
+);
+HAL_StatusTypeDef Servo_WaitForPosition(
+    uint8_t servo_id,
+    uint16_t target_position,
+    uint16_t tolerance,
+    uint32_t timeout_ms,
+    uint16_t *actual_position
+);
+HAL_StatusTypeDef Servo_ReadTelemetry(
+    uint8_t servo_id,
+    uint16_t *position,
+    uint16_t *speed_raw,
+    uint16_t *load_raw,
+    uint8_t *voltage_raw,
+    uint8_t *temperature_c
+);
+HAL_StatusTypeDef Servo_RunSmoothstep(
+    uint8_t servo_id,
+    uint16_t start_position,
+    uint16_t target_position,
+    uint32_t duration_ms
+);
+HAL_StatusTypeDef Servo_ConfigureForTrajectory(
+    uint8_t servo_id,
+    uint16_t torque_limit,
+    uint8_t p_gain,
+    uint16_t *initial_position
+);
+HAL_StatusTypeDef Servo_ReadAllPositions(
+    uint16_t positions[SINGLE_ARM_JOINT_COUNT]
+);
+HAL_StatusTypeDef Servo_SyncWritePositions(
+    const uint16_t positions[SINGLE_ARM_JOINT_COUNT]
+);
+HAL_StatusTypeDef Servo_ConfigureAllForTrajectory(
+    uint16_t initial_positions[SINGLE_ARM_JOINT_COUNT]
+);
+HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
+    const uint16_t start_positions[SINGLE_ARM_JOINT_COUNT],
+    const uint16_t target_positions[SINGLE_ARM_JOINT_COUNT],
+    uint32_t duration_ms
+);
+
+#endif /* SERVO_BUS_H */
