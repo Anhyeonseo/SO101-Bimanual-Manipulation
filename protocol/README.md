@@ -1,134 +1,130 @@
-# Pi–STM32 Wire Protocol v1 Draft
+# Pi–STM32 통신 규격 v1 초안
 
-상태: `PROPOSED`. Phase 0 벤치 측정과 사용자 검토 후 `ACCEPTED`로 변경한다.
+상태: `채택`. 단일 팔용 protocol v1은 실기에 적용했으며, 여러 sample queue와 양팔 payload 실행은 이후 단계에서 추가 검증한다.
 
 ## 1. 범위
 
-이 프로토콜은 Raspberry Pi의 ROS 2 control bridge와 NUCLEO-G474RE 사이에서만 사용한다. STM32와 STS3215 사이에는 Feetech STS bus protocol을 별도로 사용한다.
+이 규격은 Raspberry Pi의 ROS 2 제어 bridge와 NUCLEO-G474RE 사이에서 사용한다. STM32와 STS3215 사이에서는 Feetech STS bus protocol을 별도로 사용한다.
 
-```text
+~~~text
 ROS 2 / Pi
-    ↓ ST-LINK VCP, 이 문서의 protocol
+    ↓ ST-LINK VCP, 이 문서에서 정의한 protocol
 STM32G474
-    ├─ UART → Left Waveshare adapter → STS3215 IDs 1..6
-    └─ UART → Right Waveshare adapter → STS3215 IDs 1..6
-```
+    ├─ UART → Left Waveshare adapter → STS3215 ID 1~6
+    └─ UART → Right Waveshare adapter → STS3215 ID 1~6
+~~~
 
-Task의 `START`, `SEARCH`, `PLACE` 같은 의미는 ROS 계층에 남긴다. MCU protocol은 actuator 활성화, setpoint, 상태와 fault만 다룬다.
+`START`, `SEARCH`, `PLACE`처럼 작업 의미를 나타내는 상태는 ROS 계층에 둔다. MCU protocol은 actuator 활성화, setpoint, 상태와 fault만 다룬다.
 
-## 2. 전송 및 프레이밍
+## 2. 전송 방식과 frame 구분
 
-- Transport: ST-LINK Virtual COM Port
-- Byte order: little-endian
-- Framing: COBS encoded frame + `0x00` delimiter
-- Integrity: CRC-32C
-- Maximum decoded payload: 512 bytes
-- 구조체 `memcpy` 직렬화 금지: padding과 compiler ABI에 의존하지 않고 바이트 단위로 encode/decode한다.
+- 전송 경로(transport): ST-LINK Virtual COM Port
+- Byte 순서: little-endian
+- Frame 구분: COBS로 encoding한 frame 뒤에 구분값(delimiter) `0x00` 추가
+- 오류 검출: CRC-32C
+- Decode 후 payload 최대 크기: 512 byte
+- 구조체를 `memcpy`로 바로 보내지 않는다. 메모리 정렬용 여백(padding)과 compiler ABI에 의존하지 않도록 byte 단위로 encode/decode한다.
 
-Decoded frame:
+Decode한 frame 구조:
 
-| Offset | Type | Field | 설명 |
+| 시작 위치 | 자료형 | 필드 | 설명 |
 |---:|---|---|---|
-| 0 | `uint16` | magic | `0xA55A` |
-| 2 | `uint8` | version | protocol major version, 초기값 1 |
+| 0 | `uint16` | magic | 고정값 `0xA55A` |
+| 2 | `uint8` | version | protocol의 주 version, 초기값 1 |
 | 3 | `uint8` | message_type | `message_ids.json` 참조 |
-| 4 | `uint16` | flags | ACK 요구, response, error 등 |
-| 6 | `uint16` | payload_length | payload bytes, 최대 512 |
-| 8 | `uint32` | sequence | 방향별 독립 sequence |
-| 12 | `uint32` | sender_time_ms | 송신자의 monotonic time, wrap 허용 |
-| 16 | bytes | payload | message별 정의 |
-| 16+N | `uint32` | crc32c | header와 payload 전체 검사 |
+| 4 | `uint16` | flags | ACK 요청, 응답, 오류 등의 표시 |
+| 6 | `uint16` | payload_length | payload 크기, 최대 512 byte |
+| 8 | `uint32` | sequence | 전송 방향마다 따로 증가하는 번호 |
+| 12 | `uint32` | sender_time_ms | 송신 장치에서 계속 증가하는 시간, 최댓값 이후 0으로 돌아감 허용 |
+| 16 | bytes | payload | message마다 정의한 실제 데이터 |
+| 16+N | `uint32` | crc32c | header와 payload 전체 검사값 |
 
-CRC가 맞더라도 magic, version, type, length와 현재 MCU 상태가 유효하지 않으면 패킷을 거부한다.
+CRC가 맞더라도 magic, version, type, length 또는 현재 MCU 상태가 올바르지 않으면 packet을 거부한다.
 
 ## 3. Sequence와 재전송
 
-- Pi→MCU와 MCU→Pi sequence는 독립적으로 증가한다.
-- `uint32` wrap은 modular comparison으로 처리한다.
-- 중복된 state-changing command는 같은 결과를 반환하되 다시 실행하지 않는다.
-- 오래된 setpoint sequence는 거부한다.
-- ACK가 필요한 명령은 제한된 횟수와 간격으로만 재전송한다. 구체적인 값은 VCP latency 측정 후 확정한다.
+- Pi→MCU와 MCU→Pi의 sequence는 서로 독립적으로 증가한다.
+- `uint32`가 최댓값을 넘어 0으로 돌아가는 현상은 modular comparison으로 처리한다.
+- 상태를 바꾸는 명령이 중복되면 이전과 같은 결과를 반환하되 동작을 다시 실행하지 않는다.
+- 이미 지난 setpoint sequence는 거부한다.
+- ACK가 필요한 명령만 정해진 횟수와 간격으로 재전송한다. 정확한 값은 VCP 지연 시간을 측정한 뒤 확정한다.
 
-## 4. 시간 모델
+## 4. 시간 기준
 
-Header의 `sender_time_ms`는 freshness와 diagnostics용이며 두 장치의 절대 시간이 같다고 가정하지 않는다.
+Header의 `sender_time_ms`는 데이터가 오래됐는지 확인하고 문제를 진단하는 용도다. Raspberry Pi와 STM32의 절대 시간이 같다고 가정하지 않는다.
 
-Setpoint는 MCU가 보고한 `control_tick` 기준의 `apply_tick`을 사용한다.
+Setpoint는 MCU가 알려 준 `control_tick`을 기준으로 `apply_tick`을 지정한다.
 
-```text
+~~~text
 HELLO/TIME_SYNC
-→ MCU current control_tick 확인
-→ Pi가 충분한 lead time을 둔 apply_tick 생성
-→ STM32 bounded queue에 적재
-→ 같은 apply_tick에 좌우 setpoint 원자 적용
-```
+→ MCU의 현재 control_tick 확인
+→ Pi가 충분한 여유 시간(lead time)을 둔 apply_tick 생성
+→ STM32의 크기가 제한된 queue에 저장
+→ 같은 apply_tick에 좌우 setpoint를 한 번에 적용
+~~~
 
-다음 값은 벤치 측정 전 `TBD`다.
+다음 값은 양팔 및 장시간 실기 시험 후 최종 확정한다.
 
-- control loop frequency
-- minimum apply lead ticks
-- heartbeat timeout
-- setpoint queue capacity
+- control loop 주기
+- 최소 apply lead tick
+- heartbeat 제한 시간
+- setpoint queue 크기
 - queue low-watermark
 - 감속 정지 시간
 
-## 5. 관절 단위와 보정
+## 5. 관절 단위와 보정(calibration)
 
-- wire position: signed micro-radians (`int32`, µrad)
-- wire velocity: signed micro-radians/second (`int32`)
-- wire acceleration: signed micro-radians/second² (`int32`)
-- voltage: millivolts (`uint16`)
-- load: STS raw feedback와 정규화 값의 매핑을 Phase 2에서 확정
+- 전송 위치: 부호 있는 micro-radian(`int32`, µrad)
+- 전송 속도: 부호 있는 micro-radian/second(`int32`)
+- 전송 가속도: 부호 있는 micro-radian/second²(`int32`)
+- 전압: millivolt(`uint16`)
+- 부하: STS raw feedback와 정규화 값의 관계는 이후 단계에서 확정
 
-Pi는 STS3215 raw position을 보내지 않는다. STM32가 Phase 0 calibration의 sign, zero와 safe raw range를 이용해 joint unit을 raw unit으로 변환하고 마지막 제한을 적용한다.
+Raspberry Pi는 STS3215 raw 위치를 보내지 않는다. STM32가 보정 정보에 기록된 방향 부호, 원점과 안전 raw 범위를 사용해 관절 단위를 서보 raw 단위로 바꾸고 마지막 안전 제한을 적용한다.
 
-Pi와 STM32는 `calibration_hash`를 HELLO 단계에서 비교한다. 불일치 시 ARMING을 거부한다.
+Pi와 STM32는 `HELLO` 단계에서 `calibration_hash`를 비교한다. 값이 다르면 `ARMING`을 거부한다.
 
-## 6. Setpoint 원자성
+## 6. Setpoint를 한 번에 적용하는 규칙
 
-`SETPOINT_BATCH`의 한 frame에는 좌우 각 6 actuator의 목표를 포함한다. 한 팔만 움직일 때도 반대쪽 목표는 현재 Hold 목표로 채운다.
+`SETPOINT_BATCH` frame 하나에는 좌우 각 6개 actuator의 목표가 들어간다. 한 팔만 움직일 때도 반대쪽 목표를 현재 Hold 목표로 채운다.
 
-v1 payload 형식:
+v1 payload 구조:
 
-```text
+~~~text
 uint32 apply_tick_ms
-uint8  sample_count       # 1..9 (512-byte frame 제한)
+uint8  sample_count       # 1~9, 512-byte frame 제한
 uint8  arm_mask           # bit0=left, bit1=right
 uint16 reserved           # 반드시 0
 for each sample:
     uint32 tick_offset_ms
     int32  left_position_urad[6]
     int32  right_position_urad[6]
-```
+~~~
 
-단일 팔 bring-up 펌웨어는 `arm_mask=1`만 허용하며 존재하지 않는 오른팔
-목표 여섯 개가 모두 0인지 검사한다. 이 조건은 양팔 통합 시 두 팔의 현재
-hold 목표를 모두 포함하는 규칙으로 확장한다.
+현재 단일 팔 초기 구동 펌웨어는 `arm_mask=1`만 허용하고, 존재하지 않는 오른팔 목표 6개가 모두 0인지 검사한다. 양팔 통합 시에는 두 팔의 현재 Hold 목표를 모두 포함하는 규칙으로 확장한다.
 
-초기 검증 단계의 `SETPOINT_STATUS.status` 값은 다음과 같다.
+초기 검증 단계의 `SETPOINT_STATUS.status` 값:
 
-- `0`: queue accepted
-- `1`: payload/tick 형식 오류
-- `2`: ACTIVE 상태가 아니거나 stop latch 상태
-- `3`: 관절각 변환 또는 raw limit 위반
-- `4`: 지원하지 않는 arm slot 값
-- `5`: 전체 검증 통과, 실행은 compile-time으로 비활성화된 상태
-- `6`: 실행 완료 (`detail`은 최대 raw 위치 오차, 최대 255)
-- `7`: servo bus 설정·쓰기·최종 읽기 실패
-- `8`: Heartbeat/HOLD/SAFE_STOP으로 실행 중단
+- `0`: queue가 명령을 정상 접수
+- `1`: payload 또는 적용 시각 형식 오류
+- `2`: `ACTIVE` 상태가 아니거나 stop latch 상태
+- `3`: 관절각 변환 실패 또는 raw limit 위반
+- `4`: 지원하지 않는 팔 위치(slot)
+- `5`: 전체 검증은 통과했지만 실행하지 않는 validation-only 상태
+- `6`: 실행 완료. `detail`은 최대 raw 위치 오차이며 최댓값은 255
+- `7`: servo bus 설정, 쓰기 또는 최종 읽기 실패
+- `8`: Heartbeat, `HOLD` 또는 `SAFE_STOP`으로 실행 중단
 
-`flags.bit0=1`이면 패킷 전체를 검증만 하고 실행하지 않는다. 초기 단일 팔
-실행기는 `flags.bit0=0`, `sample_count=1`만 실행하며, 여러 sample의 queue
-보간은 후속 실시간 제어 단계에서 활성화한다.
+`flags.bit0=1`이면 packet 전체를 검사만 하고 실행하지 않는다. 현재 단일 팔 실행기는 `flags.bit0=0`과 `sample_count=1`만 실행한다. 여러 sample을 queue에 넣고 보간하는 기능은 이후 실시간 제어 단계에서 활성화한다.
 
-- packet 전체가 유효할 때만 queue에 반영한다.
-- 일부 joint만 반영하지 않는다.
-- NaN은 integer wire format에 존재하지 않는다.
-- unit conversion overflow, limit 위반, 불연속 setpoint는 packet 전체를 거부한다.
+- Packet 전체가 유효할 때만 queue에 반영한다.
+- 일부 관절만 따로 반영하지 않는다.
+- Integer 전송 형식에는 NaN이 존재하지 않는다.
+- 단위 변환 overflow, limit 위반 또는 불연속 setpoint가 있으면 packet 전체를 거부한다.
 
 ## 7. MCU 상태 머신
 
-```text
+~~~text
 BOOT
   → SAFE_DISABLED
   → ARMED
@@ -138,58 +134,58 @@ BOOT
 어느 상태에서든 조건에 따라:
   → FAULT
   → ESTOPPED
-```
+~~~
 
-- `SAFE_DISABLED`: 통신과 feedback은 가능하지만 actuator command 금지
-- `ARMED`: health와 configuration 검사를 통과했으나 아직 setpoint 실행 금지
-- `ACTIVE`: bounded setpoint 실행 허용
-- `HOLD`: 감속 정지 후 유지
-- `FAULT`: 원인이 제거되고 명시적 CLEAR_FAULT 전까지 latch
-- `ESTOPPED`: 물리 E-stop 입력이 해제되고 명시적 복구 절차 전까지 latch
+- `SAFE_DISABLED`: 통신과 상태값 읽기는 가능하지만 actuator 명령은 금지
+- `ARMED`: 장치 상태와 설정 검사를 통과했지만 setpoint 실행은 아직 금지
+- `ACTIVE`: 제한된 setpoint 실행 허용
+- `HOLD`: 감속 정지한 뒤 현재 위치 유지
+- `FAULT`: 원인을 제거하고 명시적으로 `CLEAR_FAULT`를 보내기 전까지 잠금 유지
+- `ESTOPPED`: 물리 E-stop 입력을 해제하고 정해진 복구 절차를 수행할 때까지 잠금 유지
 
-전원 인가, VCP 재연결, Pi process restart만으로 `ACTIVE`가 되지 않는다.
+전원 인가, VCP 재연결 또는 Pi process 재시작만으로 `ACTIVE` 상태가 되지 않는다.
 
 ## 8. 정지 명령 구분
 
 - `HOLD`: 계획된 일시 정지 또는 짧은 통신 이상
-- `SAFE_STOP`: Pi가 요청하는 감속 정지. 물리 E-stop이 아니다.
-- `DISABLE`: torque command 비활성화 요청
-- Physical E-stop: 독립 입력과 전원 계통으로 처리하고 `FAULT_REPORT`로만 보고
+- `SAFE_STOP`: Pi가 요청하는 감속 정지이며 물리 E-stop이 아님
+- `DISABLE`: torque 명령 비활성화 요청
+- 물리 E-stop: 독립 입력과 전원 계통으로 처리하고 `FAULT_REPORT`로만 상태 보고
 
-Serial message 이름으로 `ESTOP`을 사용하지 않는다. 소프트웨어 패킷이 물리 E-stop과 같은 보장을 제공한다는 오해를 피하기 위함이다.
+Serial message 이름으로 `ESTOP`을 사용하지 않는다. Software packet이 물리 E-stop과 같은 수준의 안전을 보장한다는 오해를 막기 위해서다.
 
 ## 9. Fault code 범위
 
 | 범위 | 분류 |
 |---|---|
-| `0x0000` | no fault |
-| `0x0100–0x01FF` | host link / heartbeat |
-| `0x0200–0x02FF` | framing / CRC / protocol |
-| `0x0300–0x03FF` | setpoint queue / timing |
-| `0x0400–0x04FF` | joint position/speed/acceleration limit |
-| `0x0500–0x05FF` | STS servo response / overload / temperature |
-| `0x0600–0x06FF` | power / voltage |
-| `0x0700–0x07FF` | watchdog / physical E-stop |
-| `0xFF00–0xFFFF` | internal firmware fault |
+| `0x0000` | fault 없음 |
+| `0x0100–0x01FF` | 상위 제어기 연결 또는 heartbeat |
+| `0x0200–0x02FF` | framing, CRC 또는 protocol |
+| `0x0300–0x03FF` | setpoint queue 또는 적용 시각 |
+| `0x0400–0x04FF` | 관절 위치, 속도 또는 가속도 제한 |
+| `0x0500–0x05FF` | STS 서보 응답, 과부하 또는 온도 |
+| `0x0600–0x06FF` | 전원 또는 전압 |
+| `0x0700–0x07FF` | watchdog 또는 물리 E-stop |
+| `0xFF00–0xFFFF` | 펌웨어 내부 fault |
 
-세부 fault 번호는 firmware 구현 전에 별도 machine-readable manifest로 고정한다.
+세부 fault 번호는 펌웨어에 넣기 전에 기계가 읽을 수 있는 별도 manifest로 고정한다.
 
-## 10. 검증 게이트
+## 10. 검증 항목
 
-구현 전:
+구현 전 확인:
 
-```bash
+~~~bash
 python3 tools/validate_protocol_manifest.py
-```
+~~~
 
-펌웨어 단계:
+펌웨어 단계 확인:
 
-- 임의 byte stream에서 delimiter 재동기화
-- truncated/oversized/unknown-version frame 거부
-- CRC bit flip 검출
-- duplicate command idempotence
-- stale/out-of-order setpoint 거부
-- queue overflow/underflow fault
-- heartbeat loss 정지
-- config hash 불일치 시 ARMING 거부
-- 한 팔 servo fault 시 양팔 coordinated stop
+- 임의 byte stream에서 구분값을 찾아 frame 경계를 다시 맞춤
+- 잘린 frame, 제한보다 큰 frame, 알 수 없는 version 거부
+- CRC bit가 바뀐 오류 검출
+- 중복 명령을 한 번만 실행
+- 오래됐거나 순서가 뒤바뀐 setpoint 거부
+- queue overflow/underflow fault 처리
+- heartbeat가 끊기면 정지
+- config hash가 다르면 `ARMING` 거부
+- 한 팔에서 서보 fault가 발생하면 양팔 동시 정지

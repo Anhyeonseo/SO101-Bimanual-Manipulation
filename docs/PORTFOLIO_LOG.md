@@ -2,6 +2,8 @@
 
 이 파일은 결과만 나열하지 않고 문제, 판단, 검증과 개선 과정을 기록한다.
 
+날짜가 지난 항목은 당시의 판단을 남긴 기록이다. 현재 구현 상태는 [바이너리 제어 경로 검증 결과](test-results/2026-07-20-stm32-binary-control-plane.md)와 [검증 매트릭스](VERIFICATION_MATRIX.md)를 우선해서 확인한다.
+
 ## 기록 템플릿
 
 ### YYYY-MM-DD — 작업 제목
@@ -32,16 +34,16 @@
 
 **증거**
 
-- 로그, 그래프, 사진, 영상, benchmark 결과 경로
+- 로그, 그래프, 사진, 영상, 성능 측정 결과 경로
 
 **완료 판정**
 
-- PASS/FAIL/BLOCKED
+- 통과/실패/차단
 - 다음 단계 진입 가능 여부
 
 ---
 
-## 2026-07-12 — 프로젝트 착수 및 Phase 0 정의
+## 2026-07-12 — 프로젝트 착수 및 단계 0 정의
 
 **목표**
 
@@ -57,19 +59,19 @@
 
 **설계 판단**
 
-- 오른팔 deterministic Pick and Place를 첫 통합 목표로 선택했다.
-- 정책 학습 전에 측정 가능한 baseline을 만든다.
-- Pi 카메라 성능 검증은 인식 구현보다 먼저 수행한다.
-- STM32는 FreeRTOS 기반 실시간 actuator controller로 제한한다.
+- 오른팔의 재현 가능한 Pick and Place를 첫 통합 목표로 선택했다.
+- Policy 학습 전에 측정할 수 있는 기준 동작(baseline)을 만든다.
+- Raspberry Pi 카메라 성능 검증은 인식 기능 구현보다 먼저 수행한다.
+- STM32는 실시간 actuator 제어와 안전 처리만 담당하게 제한한다.
 
 **완료 판정**
 
 - 문서 생성 후 검토 예정
-- 다음 작업: 서보 12축 하드웨어 기준선 기록
+- 다음 작업: 서보 12축의 하드웨어 기준선 기록
 
 ---
 
-## 2026-07-12 — Phase 0 측정 데이터 자동 검증
+## 2026-07-12 — 단계 0 측정 데이터 자동 검증
 
 **목표**
 
@@ -79,16 +81,16 @@
 **구현/시험**
 
 - `hardware/phase0_baseline.json` 측정 템플릿 추가
-- `tools/validate_phase0.py` fail-closed 검증기 추가
+- `tools/validate_phase0.py`에 문제가 있으면 반드시 실패하도록 만든(fail-closed) 검증기 추가
 - 정상 데이터, 오른팔 단독, 중복 관절, 비명령 동작, safe range 이탈 테스트 추가
 
 **측정 결과**
 
 | 지표 | 결과 | 조건 |
 |---|---|---|
-| 단위 테스트 | 5/5 PASS | Python unittest |
-| 실제 오른팔 baseline | FAIL, 미입력 70개 | 측정 전 템플릿 |
-| whitespace 검사 | PASS | `git diff --check` |
+| 단위 테스트 | 5/5 통과 | Python unittest |
+| 실제 오른팔 기준선 | 실패, 미입력 70개 | 측정 전 템플릿 |
+| 공백 문자 검사 | 통과 | `git diff --check` |
 
 **설계 판단**
 
@@ -105,38 +107,38 @@
 **완료 판정**
 
 - 도구 구현 PASS
-- 하드웨어 게이트는 실제 측정 전이므로 NOT RUN 유지
+- 하드웨어 게이트는 실제 측정 전이므로 미실행 유지
 
 ---
 
-## 2026-07-12 — Pi–STM32 protocol contract 초안
+## 2026-07-12 — Pi–STM32 통신 규격 초안
 
 **목표**
 
-- 펌웨어와 ROS hardware interface를 작성하기 전에 wire protocol의 책임, framing, 단위, 상태와 메시지 ID를 고정한다.
+- 펌웨어와 ROS hardware interface를 작성하기 전에 유선 통신 규격의 책임, frame 구성, 단위, 상태와 메시지 ID를 고정한다.
 
 **구현/시험**
 
-- COBS + CRC-32C 기반 frame layout 제안
-- little-endian fixed-width integer와 micro-radian 단위 정의
-- common `apply_tick` 기반 좌우 setpoint 원자성 정의
-- session/state/motion/feedback message ID manifest 작성
-- 중복 ID, reserved range, 필수 메시지, 잘못된 `ESTOP` software message 검출 테스트
+- COBS + CRC-32C 기반 frame 구조 제안
+- little-endian 고정 크기 정수와 micro-radian 단위 정의
+- 공통 `apply_tick`을 이용해 좌우 setpoint를 한 번에 적용하는 방식 정의
+- session/state/motion/feedback 메시지 ID manifest 작성
+- 중복 ID, 예약 범위, 필수 메시지, 잘못된 `ESTOP` software 메시지 검출 시험
 
 **측정 결과**
 
 | 지표 | 결과 | 조건 |
 |---|---|---|
-| 전체 repository unittest | 10/10 PASS | Phase 0 + protocol validator |
-| protocol manifest | PASS | 18개 unique message |
-| 문법/whitespace | PASS | compileall, git diff --check |
+| 저장소 전체 단위 테스트 | 10/10 통과 | 단계 0 + 통신 규격 검증기 |
+| 통신 규격 manifest | 통과 | 서로 다른 메시지 18개 |
+| 문법/공백 문자 | 통과 | compileall, git diff --check |
 
 **설계 판단**
 
 - 소프트웨어 정지는 `SAFE_STOP`, 물리 정지는 E-stop으로 명확히 구분했다.
-- Pi는 raw servo position이 아닌 joint micro-radian을 전송한다.
-- STM32가 calibration과 최종 raw limit을 적용한다.
-- timeout, queue, control rate는 실측 전 확정하지 않는다.
+- Raspberry Pi는 서보 raw 위치가 아닌 관절 micro-radian 값을 전송한다.
+- STM32가 보정 정보(calibration)와 최종 raw 제한을 적용한다.
+- timeout, queue 크기와 제어 속도는 실제로 측정하기 전에 확정하지 않는다.
 
 **증거**
 
@@ -147,39 +149,39 @@
 
 **완료 판정**
 
-- protocol structure 검증 PASS
-- ADR-0006은 하드웨어 측정과 사용자 검토 전까지 Proposed
+- 통신 규격 구조 검증 통과
+- ADR-0006은 하드웨어 측정과 사용자 검토 전까지 제안 상태
 
 ---
 
-## 2026-07-12 — Pi 카메라 역할과 compute budget
+## 2026-07-12 — Raspberry Pi 카메라 역할과 연산 자원 한도
 
 **목표**
 
-- 카메라 3대, detector, MoveIt과 향후 policy가 Pi 5 4GB 자원을 무제한 경쟁하지 않도록 phase 기반 budget을 정의한다.
+- 카메라 3대, 검출기, MoveIt과 향후 policy가 Raspberry Pi 5 4GB 자원을 무제한으로 경쟁하지 않도록 작업 단계별 연산 한도를 정의한다.
 
 **구현/시험**
 
-- Top/Left Wrist/Right Wrist 역할과 calibration 경계 정의
-- compressed latest-frame, 선택적 decode, single inference lane 구조 정의
-- 8개 task phase의 decode/inference/policy rate 작성
-- 총 vision inference, queue depth, thread 수, raw-image policy 금지 자동 검증
+- 상단/왼쪽 손목/오른쪽 손목 카메라 역할과 보정 범위 정의
+- 압축된 최신 frame, 선택적 decode, 단일 추론 실행 경로 정의
+- 작업 상태 8개의 decode, 추론, policy 실행 속도 작성
+- 전체 영상 추론 속도, queue 크기, thread 수, 원본 영상 policy 금지를 자동 검증
 
 **측정 결과**
 
 | 지표 | 결과 | 조건 |
 |---|---|---|
-| repository unittest | 15/15 PASS | baseline/protocol/camera validators |
-| camera schedule | PASS | 8개 phase |
-| 최대 vision inference | 12Hz | DUAL_PRIVATE |
-| policy input | structured state | raw image false |
+| 저장소 단위 테스트 | 15/15 통과 | 기준선·통신 규격·카메라 검증기 |
+| 카메라 실행 일정 | 통과 | 작업 상태 8개 |
+| 최대 영상 추론 속도 | 12Hz | DUAL_PRIVATE |
+| Policy 입력 | 구조화 상태 | 원본 영상 사용 안 함 |
 
 **설계 판단**
 
-- Top은 전역 평면 pose와 결과 확인, Wrist는 마지막 상대 정렬을 담당한다.
-- 카메라 연결·capture와 decode·inference rate를 분리한다.
-- vision 2 threads, policy 1 thread를 초기 상한으로 두고 실제 affinity는 benchmark 후 결정한다.
-- control/safety는 부하 저감 대상에서 제외한다.
+- 상단 카메라는 전역 평면 자세와 결과 확인, 손목 카메라는 마지막 상대 정렬을 담당한다.
+- 카메라 연결·영상 수집 속도와 decode·추론 속도를 분리한다.
+- 영상 처리 thread 2개와 policy thread 1개를 초기 상한으로 두고 실제 CPU core 고정은 성능 측정 후 결정한다.
+- 제어와 안전 처리는 부하를 줄이는 대상에서 제외한다.
 
 **증거**
 
@@ -190,5 +192,5 @@
 
 **완료 판정**
 
-- architecture와 static budget 검증 PASS
-- 실제 UVC/Pi benchmark 전까지 ADR-0007 Proposed
+- 아키텍처와 정적 연산 한도 검증 통과
+- 실제 UVC/Raspberry Pi 성능 측정 전까지 ADR-0007은 제안 상태

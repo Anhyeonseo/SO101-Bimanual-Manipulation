@@ -1,26 +1,25 @@
-# ADR-0007: Raspberry Pi camera and compute budget
+# ADR-0007: Raspberry Pi 카메라와 연산 자원 한도
 
-- 상태: Proposed
+- 상태: 제안
 - 날짜: 2026-07-12
 
-## 제안
+## 제안 내용
 
-- 세 카메라는 연결하되 상태 머신이 decode와 inference를 선택한다.
-- camera별 compressed latest frame 한 장만 유지한다.
-- vision heavy inference는 한 lane으로 직렬화하고 합계 12Hz를 초기 상한으로 둔다.
-- Top은 전역 `x, y, yaw`와 task verification, Wrist는 마지막 상대 정렬을 담당한다.
-- policy는 raw image가 아닌 structured state를 10Hz 이하로 입력받는다.
-- vision ONNX는 최대 2 intra-op threads, policy는 1 thread로 시작한다.
-- raw image DDS 상시 전송과 연속 raw rosbag을 금지한다.
+- 카메라 3대는 모두 연결하되 상태 머신이 decode와 추론을 수행할 카메라를 선택한다.
+- 카메라마다 압축된 최신 frame 한 장만 유지한다.
+- 연산량이 큰 영상 추론은 하나의 실행 경로에서 순서대로 처리하고, 초기 합계 상한은 12Hz로 둔다.
+- 상단 카메라는 전역 `x, y, yaw`와 작업 결과 확인을 담당하고, 손목 카메라는 마지막 상대 정렬을 담당한다.
+- Policy는 원본 영상이 아닌 구조화 상태를 10Hz 이하로 입력받는다.
+- 영상 ONNX는 최대 2개 intra-op thread, policy는 1개 thread로 시작한다.
+- 원본 영상을 DDS로 계속 보내거나 rosbag에 연속 기록하지 않는다.
 
 ## 이유
 
-Raspberry Pi 5 4GB에서 MoveIt, DDS, camera decode, detector와 policy가 CPU·메모리를 경쟁하므로 모든 view를 동일한 속도로 추론하면 control/safety 여유를 보장하기 어렵다.
+Raspberry Pi 5 4GB에서 MoveIt, DDS, 영상 decode, 검출기와 policy가 CPU와 메모리를 함께 사용한다. 모든 카메라 영상을 같은 속도로 추론하면 제어와 안전 처리에 필요한 여유를 보장하기 어렵다.
 
-## 승인 조건
+## 채택 조건
 
-- 실제 UVC format과 USB topology 확인
-- capture/decode/dummy inference benchmark
-- camera+policy 부하에서 STM32 heartbeat 위반 0회
-- CPU, memory, temperature와 frame age 합격 기준 충족
-
+- 실제 UVC 영상 형식과 USB 연결 구조 확인
+- 영상 수집, decode와 임시 추론 부하의 성능 측정
+- 카메라와 policy 부하 중 STM32 heartbeat 위반 0회
+- CPU, memory, 온도와 frame이 지난 시간 기준 충족

@@ -1,24 +1,26 @@
-# STM32 binary control-plane verification
+# STM32 바이너리 제어 경로 검증 결과
 
-- Date: 2026-07-20
-- Board: NUCLEO-G474RE
-- Firmware: `0x00020500`
-- Protocol: v1, COBS framing, CRC-32C
-- Servo bus: six STS3215 actuators, IDs 1 through 6
-- Calibration hash: `0x3DB42B48`
+- 시험 날짜: 2026-07-20
+- 보드: NUCLEO-G474RE
+- 펌웨어: `0x00020500`
+- 통신 규격: protocol v1, COBS framing, CRC-32C
+- 서보 bus: STS3215 actuator 6개, ID 1~6
+- 보정 정보 hash: `0x3DB42B48`
 
-## Host codec tests
+## PC frame 변환 시험
 
-- Python protocol unit tests: 6/6 PASS
-- COBS round trip: PASS
-- CRC-32C known vector: PASS
-- Corrupted frame rejection: PASS
-- Stream resynchronization: PASS
-- Message manifest parity: PASS
+- Python 통신 규격 단위 시험: 6/6 통과
+- COBS 왕복 변환: 통과
+- CRC-32C 알려진 시험값: 통과
+- 손상된 frame 거부: 통과
+- Byte stream에서 frame 경계 복구: 통과
+- 메시지 manifest 일치: 통과
 
-## Hardware-in-the-loop results
+## 실제 하드웨어 연동 결과
 
-```text
+아래는 초기 바이너리 기본 점검(smoke test) 출력이다. 이후 모듈화 회귀 시험에서는 펌웨어 `0x00020500`을 다시 확인했다.
+
+~~~text
 BINARY_SMOKE_OK
 PROTOCOL_VERSION=1
 JOINT_COUNT=6
@@ -30,41 +32,36 @@ HEARTBEAT_COUNT=1
 CRC_REJECT_COUNT=1
 LAST_HEARTBEAT_MS=2303
 SAFE_STOP_LATCH_CLEAR=OK
-```
+~~~
 
-Verified behavior:
+확인한 동작:
 
-1. The STM32 and host exchange protocol-v1 frames successfully.
-2. A deliberately corrupted CRC frame is rejected without motion.
-3. A valid heartbeat is counted.
-4. `SAFE_STOP` latches the command path without commanding motion.
-5. `CLEAR_FAULT` reads all six positions and clears the latch only after the
-   configured raw safety ranges pass.
-6. A transient servo-read failure keeps the stop latched; retry can recover
-   only after the safety read succeeds.
-7. ASCII diagnostics are suppressed after entering binary mode, preventing
-   mixed framing on the VCP link.
-8. A 500 ms heartbeat loss latches the stop; renewed heartbeat plus a passing
-   six-axis position check is required before clearing it.
+1. STM32와 상위 제어기가 protocol v1 frame을 정상적으로 주고받았다.
+2. CRC를 일부러 손상시킨 frame은 모터를 움직이지 않고 거부했다.
+3. 정상 heartbeat가 계수되는 것을 확인했다.
+4. `SAFE_STOP`은 모터 이동 명령 없이 제어 명령 경로를 잠갔다.
+5. `CLEAR_FAULT`는 6축 위치를 모두 읽고 설정된 raw 안전 범위를 통과한 뒤에만 잠금을 해제했다.
+6. 일시적인 servo 읽기 실패가 발생하면 정지 상태를 유지하고, 안전 위치를 다시 읽는 데 성공한 뒤에만 복구했다.
+7. 바이너리 모드에 들어간 뒤 ASCII 진단 출력을 막아 VCP에서 서로 다른 frame 형식이 섞이지 않게 했다.
+8. Heartbeat가 500ms 동안 끊기면 정지 상태가 잠겼다. Heartbeat를 다시 보내고 6축 위치 검사를 통과해야 잠금을 해제할 수 있었다.
 
-## Deferred expansion work
+## 이후 확장 작업
 
-- Multi-sample timestamped setpoint queue and stale/underflow handling
-- Final robot-coordinate joint zero/sign calibration against the URDF
-- Raspberry Pi transport integration and reconnection policy
+- 여러 sample과 적용 시각을 담는 setpoint queue, 오래된 값과 queue 고갈 처리
+- URDF 관절 좌표계에 맞춘 최종 관절 원점·방향 보정
+- Raspberry Pi 전송 계층 통합과 재연결 방식
 
-## Binary setpoint bring-up results
+## 바이너리 setpoint 초기 구동 결과
 
-- Six-axis `+52155 urad` command accepted and executed atomically.
-- Positive targets mapped to raw `[2082, 2082, 2014, 2014, 2082, 2014]`.
-- First outward test maximum error: 19 raw.
-- Six-axis zero-radian home return completed with maximum error: 5 raw.
-- Motion executor remained non-blocking at a 20 ms service period while host
-  heartbeats continued.
+- 6축 `+52155 urad` 명령을 한 번에 받아 동시에 실행했다.
+- 양의 관절 목표는 raw `[2082, 2082, 2014, 2014, 2082, 2014]`로 변환됐다.
+- 첫 바깥 방향 이동 시험의 최대 오차는 19 raw였다.
+- 6축을 0rad 홈으로 복귀시킨 시험의 최대 오차는 5 raw였다.
+- 동작 실행기는 20ms 주기로 비차단식으로 동작했고, 이동 중에도 상위 제어기의 heartbeat가 계속 처리됐다.
 
-## Active-motion SAFE_STOP and recovery
+## 이동 중 SAFE_STOP과 복구
 
-```text
+~~~text
 PREFLIGHT_POSITIONS=[2052, 2050, 2051, 2045, 2053, 2044]
 MOTION_ACCEPTED_STOP_SCHEDULED_400MS
 SAFE_STOP_SENT_DURING_MOTION
@@ -74,24 +71,20 @@ RESET_THEN_RUN_HOME_RECOVERY
 PREFLIGHT_POSITIONS=[2053, 2050, 2051, 2045, 2054, 2044]
 MOTION_ACCEPTED MODE=home SAMPLES=1 STATE=3
 BINARY_MOTION_OK MODE=home TARGET_URAD=[0, 0, 0, 0, 0, 0] MAX_ERROR_RAW=10
-```
+~~~
 
-Verified behavior:
+확인한 동작:
 
-1. `SAFE_STOP` interrupted an active six-axis trajectory before completion.
-2. The motion executor reported the stopped state and kept the command path
-   latched.
-3. After reset, all six axes returned to the calibrated zero-radian home.
-4. Final recovery maximum error was 10 raw, approximately 0.88 degrees at the
-   servo output shaft.
+1. `SAFE_STOP`이 실행 중인 6축 trajectory를 완료 전에 중단했다.
+2. 동작 실행기가 정지 상태를 보고하고 명령 경로의 잠금을 유지했다.
+3. Reset 후 6축 모두 보정된 0rad 홈으로 돌아왔다.
+4. 최종 복구 최대 오차는 10 raw였으며 servo 출력축 기준 약 0.88°다.
 
-## Modular firmware regression
+## 모듈화 후 회귀 시험
 
-The monolithic application was separated into `servo_bus`, `binary_control`,
-`single_arm_app`, and `single_arm_config`. The generated `main.c` now contains
-only HAL initialization and application lifecycle calls.
+하나의 파일에 모여 있던 코드를 `servo_bus`, `binary_control`, `single_arm_app`, `single_arm_config`로 분리했다. CubeMX가 생성하는 `main.c`에는 HAL 초기화와 애플리케이션 시작·반복 호출만 남겼다.
 
-```text
+~~~text
 BINARY_SMOKE_OK
 PROTOCOL_VERSION=1
 JOINT_COUNT=6
@@ -110,8 +103,6 @@ BINARY_MOTION_SAFE_STOP_OK
 PREFLIGHT_POSITIONS=[2101, 2097, 2011, 2002, 2099, 1998]
 MOTION_ACCEPTED MODE=home SAMPLES=1 STATE=3
 BINARY_MOTION_OK MODE=home TARGET_URAD=[0, 0, 0, 0, 0, 0] MAX_ERROR_RAW=5
-```
+~~~
 
-Regression result: protocol identity, calibration hash, six-axis motion,
-active-motion SAFE_STOP, and post-stop home recovery all remained valid after
-the module split.
+회귀 시험 결과, protocol 식별값과 보정 정보 hash가 유지됐다. 6축 이동, 이동 중 `SAFE_STOP`, 정지 후 홈 복구도 모듈 분리 전과 동일하게 정상 동작했다.
