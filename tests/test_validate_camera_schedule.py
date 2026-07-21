@@ -19,7 +19,7 @@ class ValidateCameraScheduleTests(unittest.TestCase):
 
     def test_total_inference_over_budget_fails(self):
         schedule = load_schedule()
-        schedule["phases"]["SEARCH"]["left_wrist"] = {"decode_hz": 10, "inference_hz": 10}
+        schedule["phases"]["SEARCH"]["wrist_a"] = {"decode_hz": 10, "inference_hz": 10}
         errors = validate_schedule(schedule)
         self.assertTrue(any("total inference" in error for error in errors))
 
@@ -44,4 +44,3 @@ class ValidateCameraScheduleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

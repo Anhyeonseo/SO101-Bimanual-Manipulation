@@ -16,12 +16,12 @@
 | MCU-002 | 단계 2 | heartbeat 단절 | 정의된 시간 안에 안전 정지 | 통과 | [바이너리 제어 경로 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
 | MCU-003 | 단계 2 | 제어 loop | overrun/underflow 0 | 미실행 | 여러 sample queue 구현 후 시험 |
 | MCU-004 | 단계 2 | 단일 팔 6축 동시 적용 | 같은 명령에서 함께 시작 | 통과 | [바이너리 제어 경로 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
-| CAM-001 | 단계 3 | 카메라 3대 capture | 장치별 목표 FPS 기록 | 미실행 |  |
-| CAM-002 | 단계 3 | 재연결 | 자동 복구 시간 기록 | 미실행 |  |
-| CAM-003 | 단계 3 | 제어 격리 | 카메라 부하 중 heartbeat 위반 0 | 미실행 |  |
+| CAM-001 | 단계 3 | 카메라 3대 capture | 장치별 목표 FPS 기록 | 통과 | [카메라 대역폭·제어 격리 결과](test-results/2026-07-21-camera-bandwidth-control-isolation.md) |
+| CAM-002 | 단계 3 | 재연결 | 자동 복구 시간 기록 | 통과 | [카메라 manager·hot-plug 결과](test-results/2026-07-21-camera-manager-hotplug.md) |
+| CAM-003 | 단계 3 | 제어 격리 | 카메라 부하 중 heartbeat 위반 0 | 통과 | [카메라 decode·DDS 제어 격리 결과](test-results/2026-07-21-camera-decode-control-load.md) |
 | CAM-004 | 단계 3 | 추론 일정 | 모든 작업 상태 합계 12Hz 이하 | 통과 | `config/camera_schedule.json` 정적 검증 |
-| CAM-005 | 단계 3 | frame 최신성 | 상태별 p95/max 기록 | 미실행 |  |
-| RES-001 | 단계 3/9 | Pi 자원 한도 | CPU/memory/temperature 기준 충족 | 미실행 |  |
+| CAM-005 | 단계 3 | frame 최신성 | 상태별 p95/max 기록 | 통과 | [phase scheduler·선택적 decode 결과](test-results/2026-07-21-camera-phase-decode-latency.md) |
+| RES-001 | 단계 3/9 | Pi 자원 한도 | CPU/memory/temperature 기준 충족 | 부분 통과 | [decode·DDS 부하 결과](test-results/2026-07-21-camera-decode-control-load.md) 통과, 실제 inference·MoveIt·장시간 부하는 미실행 |
 | POL-001 | 단계 11 | structured policy 실행 | raw image 입력 없음, deadline 기록 | 미실행 |  |
 | MOT-001 | 단계 5 | 오른팔 trajectory | 반복 실행 성공 | 통과 | [6축 OUT/HOME 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
 | MOT-002 | 단계 5 | 취소/정지 | 정해진 안전 상태 진입 | 통과 | [이동 중 SAFE_STOP 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |

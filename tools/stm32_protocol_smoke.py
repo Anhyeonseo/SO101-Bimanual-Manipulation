@@ -14,6 +14,7 @@ from actuator_protocol import (
     cobs_encode,
     decode_frame,
     encode_frame,
+    parse_state_feedback,
 )
 
 
@@ -131,10 +132,12 @@ def main() -> int:
             port.flush()
             ready = port.readline().decode("ascii", errors="replace").strip()
             if ready != "BINARY_PROTOCOL_READY_RESET_TO_EXIT":
-                raise RuntimeError(
-                    f"binary mode acknowledgement not received: {ready!r}; "
-                    "press the NUCLEO reset button and retry"
-                )
+                # A previous host may already have selected binary mode. End
+                # the partial ASCII byte as a rejected COBS packet, then prove
+                # the current mode with the HELLO exchange below.
+                port.write(b"\x00")
+                port.flush()
+                port.reset_input_buffer()
 
             send_request(port, MessageType.HELLO_REQUEST, 1)
             hello = read_binary_frame(port, "HELLO_RESPONSE")
@@ -361,6 +364,32 @@ def main() -> int:
                     )
                 setpoint_validation_tested = True
 
+            position_feedback = None
+            if (capabilities & 0x00000008) != 0:
+                send_request(
+                    port,
+                    MessageType.GET_STATE,
+                    next_sequence,
+                    payload=b"\x01",
+                )
+                position_state = read_binary_frame(port, "GET_STATE_POSITIONS")
+                next_sequence += 1
+                if position_state.message_type is not MessageType.STATE_FEEDBACK:
+                    raise RuntimeError(
+                        "position GET_STATE did not return STATE_FEEDBACK"
+                    )
+                parsed_position_state = parse_state_feedback(position_state.payload)
+                if (
+                    parsed_position_state.status_code != 0
+                    or parsed_position_state.raw_positions is None
+                    or len(parsed_position_state.raw_positions) != 6
+                ):
+                    raise RuntimeError(
+                        "position feedback missing or invalid: "
+                        f"status={parsed_position_state.status_code}"
+                    )
+                position_feedback = parsed_position_state.raw_positions
+
             print("BINARY_SMOKE_OK")
             print(f"PROTOCOL_VERSION={protocol_version}")
             print(f"JOINT_COUNT={joint_count}")
@@ -377,6 +406,8 @@ def main() -> int:
                 print("HEARTBEAT_TIMEOUT_LATCH_CLEAR=OK")
             if setpoint_validation_tested:
                 print("SETPOINT_HOME_VALIDATION_ONLY=OK")
+            if position_feedback is not None:
+                print(f"RAW_POSITION_FEEDBACK={list(position_feedback)}")
             return 0
     except Exception as error:
         print(f"BINARY_SMOKE_FAIL: {error}", file=sys.stderr)

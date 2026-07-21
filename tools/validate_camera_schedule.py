@@ -9,8 +9,17 @@ from pathlib import Path
 from typing import Any
 
 
-CAMERAS = ("top", "left_wrist", "right_wrist")
-REQUIRED_PHASES = {"STANDBY", "SEARCH", "APPROACH_RIGHT", "VISUAL_ALIGN_RIGHT", "POLICY_ASSIST"}
+CAMERAS = ("top", "wrist_a", "wrist_b")
+REQUIRED_PHASES = {
+    "STANDBY",
+    "SEARCH",
+    "APPROACH_RIGHT",
+    "VISUAL_ALIGN_RIGHT",
+    "TRANSFER_RIGHT",
+    "VERIFY_RIGHT",
+    "DUAL_PRIVATE",
+    "POLICY_ASSIST",
+}
 
 
 def _nonnegative_number(value: Any) -> bool:
@@ -116,4 +125,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

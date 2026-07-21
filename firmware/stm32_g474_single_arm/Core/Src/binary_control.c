@@ -42,6 +42,12 @@ static void Host_WriteU32Le(uint8_t *destination, uint32_t value)
     destination[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
+static void Host_WriteU16Le(uint8_t *destination, uint16_t value)
+{
+    destination[0] = (uint8_t)(value & 0xFFU);
+    destination[1] = (uint8_t)((value >> 8U) & 0xFFU);
+}
+
 static uint16_t Host_ReadU16Le(const uint8_t *source)
 {
     return (uint16_t)(
@@ -154,6 +160,50 @@ static void Host_SendBinaryState(
         &response.payload[16],
         host_binary_last_heartbeat_ms
     );
+
+    (void)Host_SendBinaryFrame(&response);
+}
+
+static void Host_SendBinaryStateWithPositions(
+    uint32_t request_sequence
+)
+{
+    uint16_t positions[SINGLE_ARM_JOINT_COUNT] = {0U};
+
+    if (Servo_ReadAllPositions(positions) != HAL_OK)
+    {
+        host_stop_latched = 1U;
+        Host_SendBinaryState(request_sequence, 2U);
+        return;
+    }
+
+    actuator_frame_t response;
+    memset(&response, 0, sizeof(response));
+
+    response.message_type = ACTUATOR_MSG_STATE_FEEDBACK;
+    response.sequence = request_sequence;
+    response.sender_time_ms = HAL_GetTick();
+    response.payload_length =
+        20U + (2U * SINGLE_ARM_JOINT_COUNT);
+    response.payload[0] = (host_stop_latched != 0U) ? 1U : 0U;
+    response.payload[1] = 0U;
+    response.payload[2] = servo_joint_count;
+    response.payload[3] = (uint8_t)ACTUATOR_PROTOCOL_VERSION;
+    Host_WriteU32Le(&response.payload[4], host_binary_heartbeat_count);
+    Host_WriteU32Le(&response.payload[8], host_binary_rejected_frame_count);
+    Host_WriteU32Le(&response.payload[12], Host_CalibrationHash());
+    Host_WriteU32Le(
+        &response.payload[16],
+        host_binary_last_heartbeat_ms
+    );
+
+    for (uint8_t joint = 0U; joint < servo_joint_count; joint++)
+    {
+        Host_WriteU16Le(
+            &response.payload[20U + ((uint16_t)joint * 2U)],
+            positions[joint]
+        );
+    }
 
     (void)Host_SendBinaryFrame(&response);
 }
@@ -306,6 +356,9 @@ static void Host_StartBinaryMotion(
         host_binary_motion.start_tick;
     host_binary_motion.verifying = 0U;
     host_binary_motion.active = 1U;
+    Servo_MotionSafetyBegin(
+        (uint8_t)((1U << SINGLE_ARM_JOINT_COUNT) - 1U)
+    );
 
     Host_SendBinarySetpointStatus(
         request->sequence,
@@ -333,6 +386,7 @@ static void Host_ServiceBinaryMotion(void)
             &host_binary_safety))
     {
         host_binary_motion.active = 0U;
+        Servo_MotionSafetyEnd();
         Host_SendBinarySetpointStatus(
             host_binary_motion.request_sequence,
             8U,
@@ -360,6 +414,7 @@ static void Host_ServiceBinaryMotion(void)
         {
             host_binary_motion.active = 0U;
             host_stop_latched = 1U;
+            Servo_MotionSafetyEnd();
             Host_SendBinarySetpointStatus(
                 host_binary_motion.request_sequence,
                 7U,
@@ -395,6 +450,7 @@ static void Host_ServiceBinaryMotion(void)
         }
 
         host_binary_motion.active = 0U;
+        Servo_MotionSafetyEnd();
         Host_SendBinarySetpointStatus(
             host_binary_motion.request_sequence,
             6U,
@@ -455,6 +511,7 @@ static void Host_ServiceBinaryMotion(void)
             {
                 host_binary_motion.active = 0U;
                 host_stop_latched = 1U;
+                Servo_MotionSafetyEnd();
                 Host_SendBinarySetpointStatus(
                     host_binary_motion.request_sequence,
                     7U,
@@ -473,6 +530,7 @@ static void Host_ServiceBinaryMotion(void)
     {
         host_binary_motion.active = 0U;
         host_stop_latched = 1U;
+        Servo_MotionSafetyEnd();
         Host_SendBinarySetpointStatus(
             host_binary_motion.request_sequence,
             7U,
@@ -480,6 +538,27 @@ static void Host_ServiceBinaryMotion(void)
             host_binary_motion.start_tick +
                 host_binary_motion.duration_ms,
             0U
+        );
+        return;
+    }
+
+    HAL_StatusTypeDef safety_status = Servo_MotionSafetyPoll();
+
+    if (safety_status != HAL_OK)
+    {
+        const ServoMotionSafetyDiagnostics *diagnostics =
+            Servo_MotionSafetyGetDiagnostics();
+
+        host_binary_motion.active = 0U;
+        host_stop_latched = 1U;
+        Servo_MotionSafetyEnd();
+        Host_SendBinarySetpointStatus(
+            host_binary_motion.request_sequence,
+            9U,
+            1U,
+            host_binary_motion.start_tick +
+                host_binary_motion.duration_ms,
+            diagnostics->servo_id
         );
         return;
     }
@@ -680,10 +759,19 @@ static void Host_HandleBinaryFrame(const actuator_frame_t *request)
             break;
 
         case ACTUATOR_MSG_GET_STATE:
-            Host_SendBinaryState(
-                request->sequence,
-                (request->payload_length == 0U) ? 0U : 1U
-            );
+            if (request->payload_length == 0U)
+            {
+                Host_SendBinaryState(request->sequence, 0U);
+            }
+            else if ((request->payload_length == 1U) &&
+                     (request->payload[0] == 1U))
+            {
+                Host_SendBinaryStateWithPositions(request->sequence);
+            }
+            else
+            {
+                Host_SendBinaryState(request->sequence, 1U);
+            }
             break;
 
         case ACTUATOR_MSG_ARM_REQUEST:
@@ -872,6 +960,7 @@ void BinaryControl_Init(UART_HandleTypeDef *host_uart)
     host_binary_mode = 0U;
     host_binary_servos_configured = 0U;
     memset(&host_binary_motion, 0, sizeof(host_binary_motion));
+    Servo_MotionSafetyEnd();
 
     actuator_stream_parser_init(&host_binary_parser);
     actuator_safety_init(
@@ -947,4 +1036,3 @@ void BinaryControl_ClearStopLatch(void)
 {
     host_stop_latched = 0U;
 }
-

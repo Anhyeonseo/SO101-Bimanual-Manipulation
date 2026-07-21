@@ -15,7 +15,7 @@ static uint8_t return_available = 0U;
 static uint8_t synchronized_pose_active = 0U;
 static uint8_t absolute_pose_active = 0U;
 static uint16_t return_position = 0U;
-static char status_line[128];
+static char status_line[192];
 static uint8_t active_servo_id = 1U;
 static const char *active_joint_name = "BASE";
 static uint16_t active_test_delta = 34U;
@@ -70,6 +70,60 @@ static void SingleArmApp_ReportServoReadFailure(uint8_t servo_id)
                 100U
             );
         }
+    }
+}
+
+static void SingleArmApp_ReportMotionSafety(void)
+{
+    const ServoMotionSafetyDiagnostics *diagnostics =
+        Servo_MotionSafetyGetDiagnostics();
+
+    if ((diagnostics == NULL) ||
+        (diagnostics->reason == SERVO_MOTION_SAFETY_NONE))
+    {
+        return;
+    }
+
+    BinaryControl_LatchStop();
+
+    if (BinaryControl_IsBinaryMode() != 0U)
+    {
+        return;
+    }
+
+    const char *reason = "READ";
+
+    if (diagnostics->reason == SERVO_MOTION_SAFETY_LOAD_LIMIT)
+    {
+        reason = "LOAD";
+    }
+    else if (diagnostics->reason ==
+        SERVO_MOTION_SAFETY_CURRENT_LIMIT)
+    {
+        reason = "CURRENT";
+    }
+
+    int line_length = snprintf(
+        status_line,
+        sizeof(status_line),
+        "MOTION_SAFETY_ABORT REASON=%s ID=%u LOAD_RAW=%u CURRENT_RAW=%u MAX_LOAD_RAW=%u MAX_CURRENT_RAW=%u\r\n",
+        reason,
+        (unsigned int)diagnostics->servo_id,
+        (unsigned int)diagnostics->last_load_raw,
+        (unsigned int)diagnostics->last_current_raw,
+        (unsigned int)diagnostics->maximum_load_raw,
+        (unsigned int)diagnostics->maximum_current_raw
+    );
+
+    if ((line_length > 0) &&
+        (line_length < (int)sizeof(status_line)))
+    {
+        (void)HAL_UART_Transmit(
+            app_host_uart,
+            (uint8_t *)status_line,
+            (uint16_t)line_length,
+            100U
+        );
     }
 }
 
@@ -854,6 +908,7 @@ void SingleArmApp_Process(void)
 	                                      message_length,
 	                                      100U
 	                                  );
+	                                  SingleArmApp_ReportMotionSafety();
 	                              }
 	                              else
 	                              {
@@ -1105,6 +1160,7 @@ void SingleArmApp_Process(void)
 	                              sizeof(run_fail) - 1U,
 	                              100U
 	                          );
+	                          SingleArmApp_ReportMotionSafety();
 	                      }
 	                      else
 	                      {
@@ -1247,6 +1303,7 @@ void SingleArmApp_Process(void)
 	                      sizeof(run_fail) - 1U,
 	                      100U
 	                  );
+	                  SingleArmApp_ReportMotionSafety();
 	              }
 	              else
 	              {
@@ -1338,19 +1395,21 @@ void SingleArmApp_Process(void)
     	      {
     	          uint16_t position = 0U;
     	          uint16_t speed_raw = 0U;
-    	          uint16_t load_raw = 0U;
-    	          uint8_t voltage_raw = 0U;
-    	          uint8_t temperature_c = 0U;
+	          uint16_t load_raw = 0U;
+	          uint8_t voltage_raw = 0U;
+	          uint8_t temperature_c = 0U;
+	          uint16_t current_raw = 0U;
 
     	          HAL_StatusTypeDef telemetry_status =
     	              Servo_ReadTelemetry(
     	                  servo_joints[joint_index].id,
     	                  &position,
     	                  &speed_raw,
-    	                  &load_raw,
-    	                  &voltage_raw,
-    	                  &temperature_c
-    	              );
+	                  &load_raw,
+	                  &voltage_raw,
+	                  &temperature_c,
+	                  &current_raw
+	              );
 
     	          int line_length;
 
@@ -1362,18 +1421,28 @@ void SingleArmApp_Process(void)
 	                  ((load_raw & 0x0400U) != 0U)
 	                      ? -(int16_t)load_magnitude
 	                      : (int16_t)load_magnitude;
+	              int32_t current_signed =
+	                  (int32_t)(int16_t)current_raw;
+	              if (current_signed < 0)
+	              {
+	                  current_signed = -current_signed;
+	              }
+	              uint32_t current_ma =
+	                  ((uint32_t)current_signed * 65U) / 10U;
 
 	              line_length = snprintf(
 	                  status_line,
 	                  sizeof(status_line),
-	                  "AXIS ID=%u NAME=%s POS=%u SPEED_RAW=%u LOAD=%d LOAD_RAW=%u VOLT=%u.%uV TEMP=%uC MOTION=%s\r\n",
+	                  "AXIS ID=%u NAME=%s POS=%u SPEED_RAW=%u LOAD=%d LOAD_RAW=%u CURRENT_RAW=%lu CURRENT_MA=%lu VOLT=%u.%uV TEMP=%uC MOTION=%s\r\n",
 	                  (unsigned int)servo_joints[joint_index].id,
 	                  servo_joints[joint_index].name,
 	                  (unsigned int)position,
 	                  (unsigned int)speed_raw,
 	                  (int)load_signed,
 	                  (unsigned int)load_raw,
-    	                  (unsigned int)(voltage_raw / 10U),
+	                  (unsigned long)current_signed,
+	                  (unsigned long)current_ma,
+	                  (unsigned int)(voltage_raw / 10U),
     	                  (unsigned int)(voltage_raw % 10U),
     	                  (unsigned int)temperature_c,
     	                  (servo_joints[joint_index].motion_enabled != 0U)
@@ -1562,6 +1631,7 @@ void SingleArmApp_Process(void)
                               sizeof(out_write_fail) - 1U,
                               100U
                           );
+                          SingleArmApp_ReportMotionSafety();
                       }
                   }
                   else
@@ -1843,12 +1913,13 @@ void SingleArmApp_Process(void)
     	                      static const uint8_t home_move_fail[] =
     	                          "HOME_MOVE_FAIL\r\n";
 
-    	                      (void)HAL_UART_Transmit(
-    	                          app_host_uart,
-    	                          (uint8_t *)home_move_fail,
-    	                          sizeof(home_move_fail) - 1U,
-    	                          100U
-    	                      );
+	                      (void)HAL_UART_Transmit(
+	                          app_host_uart,
+	                          (uint8_t *)home_move_fail,
+	                          sizeof(home_move_fail) - 1U,
+	                          100U
+	                      );
+	                      SingleArmApp_ReportMotionSafety();
     	                  }
     	              }
     	          }
@@ -1987,6 +2058,7 @@ void SingleArmApp_Process(void)
                               sizeof(return_write_fail) - 1U,
                               100U
                           );
+                          SingleArmApp_ReportMotionSafety();
                       }
                   }
                   else

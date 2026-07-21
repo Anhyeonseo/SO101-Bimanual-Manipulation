@@ -103,7 +103,7 @@ Right Wrist V4L2 Capture Thread ┘            ↓
 
 - C++17
 - V4L2 mmap을 우선 사용하고, 측정 결과에 따라 GStreamer로 대체
-- UVC MJPEG 우선, `640×480 @ 15FPS` 시작
+- UVC MJPEG 우선, 실측 공통 mode인 `640×480 @ 30FPS`로 수집
 - 카메라별로 압축된 최신 frame 한 장만 유지
 - 현재 사용하는 카메라 영상만 libjpeg-turbo/OpenCV로 decode
 - inference input `320×320`부터 시작

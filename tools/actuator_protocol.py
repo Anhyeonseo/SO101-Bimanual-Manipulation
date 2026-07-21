@@ -17,6 +17,8 @@ VERSION = 1
 MAX_PAYLOAD = 512
 HEADER = struct.Struct("<HBBHHII")
 CRC = struct.Struct("<I")
+STATE_FEEDBACK_BASE = struct.Struct("<BBBBIIII")
+STATE_FEEDBACK_POSITIONS = struct.Struct("<6H")
 
 
 class MessageType(IntEnum):
@@ -54,6 +56,58 @@ class Frame:
     sequence: int = 0
     sender_time_ms: int = 0
     payload: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class StateFeedback:
+    stop_latched: bool
+    status_code: int
+    joint_count: int
+    protocol_version: int
+    heartbeat_count: int
+    rejected_frame_count: int
+    calibration_hash: int
+    last_heartbeat_ms: int
+    raw_positions: tuple[int, ...] | None = None
+
+
+def parse_state_feedback(payload: bytes) -> StateFeedback:
+    """Parse legacy state or capability-bit-3 position feedback."""
+
+    base_size = STATE_FEEDBACK_BASE.size
+    position_size = STATE_FEEDBACK_POSITIONS.size
+    if len(payload) not in (base_size, base_size + position_size):
+        raise ProtocolError(
+            f"STATE_FEEDBACK payload must be {base_size} or "
+            f"{base_size + position_size} bytes"
+        )
+
+    (
+        stop_latched,
+        status_code,
+        joint_count,
+        protocol_version,
+        heartbeat_count,
+        rejected_frame_count,
+        calibration_hash,
+        last_heartbeat_ms,
+    ) = STATE_FEEDBACK_BASE.unpack_from(payload)
+
+    raw_positions = None
+    if len(payload) == base_size + position_size:
+        raw_positions = STATE_FEEDBACK_POSITIONS.unpack_from(payload, base_size)
+
+    return StateFeedback(
+        stop_latched=stop_latched != 0,
+        status_code=status_code,
+        joint_count=joint_count,
+        protocol_version=protocol_version,
+        heartbeat_count=heartbeat_count,
+        rejected_frame_count=rejected_frame_count,
+        calibration_hash=calibration_hash,
+        last_heartbeat_ms=last_heartbeat_ms,
+        raw_positions=raw_positions,
+    )
 
 
 def crc32c(data: bytes) -> int:

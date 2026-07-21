@@ -1,0 +1,6 @@
+single_arm_bridge:
+  ros__parameters:
+    serial_device: auto
+    baud_rate: 115200
+    feedback_rate_hz: 5.0
+    allow_motion: false

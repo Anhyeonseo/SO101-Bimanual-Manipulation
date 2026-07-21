@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import struct
 import unittest
 
 from tools.actuator_protocol import (
@@ -12,10 +13,38 @@ from tools.actuator_protocol import (
     crc32c,
     decode_frame,
     encode_frame,
+    parse_state_feedback,
 )
 
 
 class ActuatorProtocolTests(unittest.TestCase):
+    def test_state_feedback_accepts_legacy_and_position_extension(self) -> None:
+        base = struct.pack(
+            "<BBBBIIII",
+            0,
+            0,
+            6,
+            1,
+            4,
+            2,
+            0x3DB42B48,
+            1234,
+        )
+        legacy = parse_state_feedback(base)
+        self.assertIsNone(legacy.raw_positions)
+
+        extended = parse_state_feedback(
+            base + struct.pack("<6H", 2048, 2049, 2047, 2050, 2046, 2048)
+        )
+        self.assertEqual(
+            extended.raw_positions,
+            (2048, 2049, 2047, 2050, 2046, 2048),
+        )
+
+    def test_state_feedback_rejects_unknown_payload_size(self) -> None:
+        with self.assertRaises(ProtocolError):
+            parse_state_feedback(b"\x00" * 21)
+
     def test_crc32c_known_vector_matches_c_core(self) -> None:
         self.assertEqual(crc32c(b"123456789"), 0xE3069283)
 

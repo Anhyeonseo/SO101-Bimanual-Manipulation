@@ -24,6 +24,24 @@ typedef struct
 typedef uint8_t (*ServoStopRequestedFn)(void);
 typedef void (*ServoReadFailureFn)(uint8_t servo_id);
 
+typedef enum
+{
+    SERVO_MOTION_SAFETY_NONE = 0,
+    SERVO_MOTION_SAFETY_LOAD_LIMIT = 1,
+    SERVO_MOTION_SAFETY_CURRENT_LIMIT = 2,
+    SERVO_MOTION_SAFETY_READ_FAILURE = 3
+} ServoMotionSafetyReason;
+
+typedef struct
+{
+    ServoMotionSafetyReason reason;
+    uint8_t servo_id;
+    uint16_t last_load_raw;
+    uint16_t last_current_raw;
+    uint16_t maximum_load_raw;
+    uint16_t maximum_current_raw;
+} ServoMotionSafetyDiagnostics;
+
 extern const ServoJointConfig servo_joints[SINGLE_ARM_JOINT_COUNT];
 extern const uint8_t servo_joint_count;
 extern uint8_t servo_last_all_read_failed_id;
@@ -72,8 +90,13 @@ HAL_StatusTypeDef Servo_ReadTelemetry(
     uint16_t *speed_raw,
     uint16_t *load_raw,
     uint8_t *voltage_raw,
-    uint8_t *temperature_c
+    uint8_t *temperature_c,
+    uint16_t *current_raw
 );
+void Servo_MotionSafetyBegin(uint8_t joint_mask);
+void Servo_MotionSafetyEnd(void);
+HAL_StatusTypeDef Servo_MotionSafetyPoll(void);
+const ServoMotionSafetyDiagnostics *Servo_MotionSafetyGetDiagnostics(void);
 HAL_StatusTypeDef Servo_RunSmoothstep(
     uint8_t servo_id,
     uint16_t start_position,

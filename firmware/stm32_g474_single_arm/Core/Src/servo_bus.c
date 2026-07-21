@@ -1,16 +1,25 @@
 #include "servo_bus.h"
 
 #include <stddef.h>
+#include <string.h>
 
 static UART_HandleTypeDef *servo_uart_handle = NULL;
 static ServoStopRequestedFn servo_stop_requested = NULL;
 static ServoReadFailureFn servo_read_failure = NULL;
 
+static uint8_t servo_motion_safety_mask = 0U;
+static uint32_t servo_motion_safety_last_sample_ms = 0U;
+static uint8_t servo_load_limit_counts[SINGLE_ARM_JOINT_COUNT] = {0U};
+static uint8_t servo_current_limit_counts[SINGLE_ARM_JOINT_COUNT] = {0U};
+static ServoMotionSafetyDiagnostics servo_motion_safety_diagnostics = {
+    SERVO_MOTION_SAFETY_NONE, 0U, 0U, 0U, 0U, 0U
+};
+
 const ServoJointConfig servo_joints[SINGLE_ARM_JOINT_COUNT] = {
     {1U, "BASE",        1U, 2048U, 2048U, 2389U, 16U,  1,  34U,  600U, 400U},
-    {2U, "SHOULDER",    1U, 2048U, 2048U, 2162U, 16U,  1,  34U, 1200U, 500U},
-    {3U, "ELBOW",       1U, 2048U, 1934U, 2048U, 24U, -1,  34U, 1000U, 400U},
-    {4U, "WRIST_FLEX",  1U, 2048U, 1934U, 2048U, 16U, -1,  34U,  800U, 300U},
+    {2U, "SHOULDER",    1U, 2048U, 2048U, 2162U, 16U,  1,  34U, 1200U, 650U},
+    {3U, "ELBOW",       1U, 2048U, 1934U, 2048U, 24U, -1,  34U, 1000U, 550U},
+    {4U, "WRIST_FLEX",  1U, 2048U, 1934U, 2048U, 16U, -1,  34U,  800U, 400U},
     {5U, "WRIST_ROLL",  1U, 2048U, 2048U, 2219U, 16U,  1,  34U,  500U, 250U},
     {6U, "GRIPPER",     1U, 2048U, 1934U, 2048U, 16U, -1,  34U,  800U, 150U}
 };
@@ -28,6 +37,12 @@ void ServoBus_Init(
     servo_stop_requested = stop_requested;
     servo_read_failure = read_failure;
     servo_last_all_read_failed_id = 0U;
+    Servo_MotionSafetyEnd();
+    memset(
+        &servo_motion_safety_diagnostics,
+        0,
+        sizeof(servo_motion_safety_diagnostics)
+    );
 }
 
 static uint8_t Servo_Checksum(
@@ -362,10 +377,23 @@ HAL_StatusTypeDef Servo_ReadTelemetry(
     uint16_t *speed_raw,
     uint16_t *load_raw,
     uint8_t *voltage_raw,
-    uint8_t *temperature_c
+    uint8_t *temperature_c,
+    uint16_t *current_raw
 )
 {
-    uint8_t telemetry[8] = {0U};
+    if ((position == NULL) ||
+        (speed_raw == NULL) ||
+        (load_raw == NULL) ||
+        (voltage_raw == NULL) ||
+        (temperature_c == NULL) ||
+        (current_raw == NULL))
+    {
+        return HAL_ERROR;
+    }
+
+    /* Address 56 through 70: position, speed, load, voltage,
+       temperature, asynchronous-write flag/status/moving, current. */
+    uint8_t telemetry[15] = {0U};
 
     HAL_StatusTypeDef status = Servo_ReadData(
         servo_id,
@@ -393,9 +421,173 @@ HAL_StatusTypeDef Servo_ReadTelemetry(
 
         *voltage_raw = telemetry[6];
         *temperature_c = telemetry[7];
+
+        *current_raw = (uint16_t)(
+            (uint16_t)telemetry[13] |
+            ((uint16_t)telemetry[14] << 8)
+        );
     }
 
     return status;
+}
+
+static uint16_t Servo_CurrentMagnitude(uint16_t current_raw)
+{
+    int32_t signed_current = (int32_t)(int16_t)current_raw;
+
+    if (signed_current < 0)
+    {
+        signed_current = -signed_current;
+    }
+
+    return (uint16_t)signed_current;
+}
+
+void Servo_MotionSafetyBegin(uint8_t joint_mask)
+{
+    servo_motion_safety_mask = joint_mask;
+    servo_motion_safety_last_sample_ms =
+        HAL_GetTick() - SERVO_MOTION_SAFETY_SAMPLE_MS;
+
+    memset(
+        servo_load_limit_counts,
+        0,
+        sizeof(servo_load_limit_counts)
+    );
+    memset(
+        servo_current_limit_counts,
+        0,
+        sizeof(servo_current_limit_counts)
+    );
+    memset(
+        &servo_motion_safety_diagnostics,
+        0,
+        sizeof(servo_motion_safety_diagnostics)
+    );
+}
+
+void Servo_MotionSafetyEnd(void)
+{
+    servo_motion_safety_mask = 0U;
+}
+
+const ServoMotionSafetyDiagnostics *Servo_MotionSafetyGetDiagnostics(void)
+{
+    return &servo_motion_safety_diagnostics;
+}
+
+HAL_StatusTypeDef Servo_MotionSafetyPoll(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((servo_motion_safety_mask == 0U) ||
+        ((now - servo_motion_safety_last_sample_ms) <
+            SERVO_MOTION_SAFETY_SAMPLE_MS))
+    {
+        return HAL_OK;
+    }
+
+    servo_motion_safety_last_sample_ms = now;
+
+    for (uint8_t i = 0U; i < servo_joint_count; i++)
+    {
+        if ((servo_motion_safety_mask & (uint8_t)(1U << i)) == 0U)
+        {
+            continue;
+        }
+
+        uint16_t position = 0U;
+        uint16_t speed_raw = 0U;
+        uint16_t load_raw = 0U;
+        uint8_t voltage_raw = 0U;
+        uint8_t temperature_c = 0U;
+        uint16_t current_raw = 0U;
+
+        if (Servo_ReadTelemetry(
+                servo_joints[i].id,
+                &position,
+                &speed_raw,
+                &load_raw,
+                &voltage_raw,
+                &temperature_c,
+                &current_raw
+            ) != HAL_OK)
+        {
+            servo_motion_safety_diagnostics.reason =
+                SERVO_MOTION_SAFETY_READ_FAILURE;
+            servo_motion_safety_diagnostics.servo_id =
+                servo_joints[i].id;
+            return HAL_ERROR;
+        }
+
+        uint16_t load_magnitude =
+            (uint16_t)(load_raw & 0x03FFU);
+        uint16_t current_magnitude =
+            Servo_CurrentMagnitude(current_raw);
+
+        servo_motion_safety_diagnostics.servo_id =
+            servo_joints[i].id;
+        servo_motion_safety_diagnostics.last_load_raw =
+            load_magnitude;
+        servo_motion_safety_diagnostics.last_current_raw =
+            current_magnitude;
+
+        if (load_magnitude >
+            servo_motion_safety_diagnostics.maximum_load_raw)
+        {
+            servo_motion_safety_diagnostics.maximum_load_raw =
+                load_magnitude;
+        }
+
+        if (current_magnitude >
+            servo_motion_safety_diagnostics.maximum_current_raw)
+        {
+            servo_motion_safety_diagnostics.maximum_current_raw =
+                current_magnitude;
+        }
+
+        if (load_magnitude >= SERVO_MOTION_LOAD_LIMIT_RAW)
+        {
+            if (servo_load_limit_counts[i] < UINT8_MAX)
+            {
+                servo_load_limit_counts[i]++;
+            }
+        }
+        else
+        {
+            servo_load_limit_counts[i] = 0U;
+        }
+
+        if (current_magnitude >= SERVO_MOTION_CURRENT_LIMIT_RAW)
+        {
+            if (servo_current_limit_counts[i] < UINT8_MAX)
+            {
+                servo_current_limit_counts[i]++;
+            }
+        }
+        else
+        {
+            servo_current_limit_counts[i] = 0U;
+        }
+
+        if (servo_load_limit_counts[i] >=
+            SERVO_MOTION_LIMIT_CONSECUTIVE)
+        {
+            servo_motion_safety_diagnostics.reason =
+                SERVO_MOTION_SAFETY_LOAD_LIMIT;
+            return HAL_BUSY;
+        }
+
+        if (servo_current_limit_counts[i] >=
+            SERVO_MOTION_LIMIT_CONSECUTIVE)
+        {
+            servo_motion_safety_diagnostics.reason =
+                SERVO_MOTION_SAFETY_CURRENT_LIMIT;
+            return HAL_BUSY;
+        }
+    }
+
+    return HAL_OK;
 }
 
 static uint8_t Host_StopRequestedDuringMotion(void)
@@ -416,12 +608,29 @@ HAL_StatusTypeDef Servo_RunSmoothstep(
 )
 {
     const uint32_t control_period_ms = 20U;
+    uint8_t joint_mask = 0U;
 
     if ((duration_ms < control_period_ms) ||
         ((duration_ms % control_period_ms) != 0U))
     {
         return HAL_ERROR;
     }
+
+    for (uint8_t i = 0U; i < servo_joint_count; i++)
+    {
+        if (servo_joints[i].id == servo_id)
+        {
+            joint_mask = (uint8_t)(1U << i);
+            break;
+        }
+    }
+
+    if (joint_mask == 0U)
+    {
+        return HAL_ERROR;
+    }
+
+    Servo_MotionSafetyBegin(joint_mask);
 
     uint32_t trajectory_steps =
         duration_ms / control_period_ms;
@@ -441,6 +650,7 @@ HAL_StatusTypeDef Servo_RunSmoothstep(
     {
         if (Host_StopRequestedDuringMotion() != 0U)
         {
+            Servo_MotionSafetyEnd();
             return HAL_BUSY;
         }
 
@@ -474,7 +684,17 @@ HAL_StatusTypeDef Servo_RunSmoothstep(
                 sizeof(goal_data)
             ) != HAL_OK)
         {
+            Servo_MotionSafetyEnd();
             return HAL_ERROR;
+        }
+
+        HAL_StatusTypeDef safety_status =
+            Servo_MotionSafetyPoll();
+
+        if (safety_status != HAL_OK)
+        {
+            Servo_MotionSafetyEnd();
+            return safety_status;
         }
 
         uint32_t elapsed =
@@ -486,6 +706,7 @@ HAL_StatusTypeDef Servo_RunSmoothstep(
         }
     }
 
+    Servo_MotionSafetyEnd();
     return HAL_OK;
 }
 
@@ -734,6 +955,10 @@ HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
         return HAL_ERROR;
     }
 
+    Servo_MotionSafetyBegin(
+        (uint8_t)((1U << SINGLE_ARM_JOINT_COUNT) - 1U)
+    );
+
     uint32_t denominator =
         trajectory_steps *
         trajectory_steps *
@@ -745,6 +970,7 @@ HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
     {
         if (Host_StopRequestedDuringMotion() != 0U)
         {
+            Servo_MotionSafetyEnd();
             return HAL_BUSY;
         }
 
@@ -773,6 +999,7 @@ HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
 
             if ((setpoint < 0) || (setpoint > 4095))
             {
+                Servo_MotionSafetyEnd();
                 return HAL_ERROR;
             }
 
@@ -781,7 +1008,17 @@ HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
 
         if (Servo_SyncWritePositions(setpoints) != HAL_OK)
         {
+            Servo_MotionSafetyEnd();
             return HAL_ERROR;
+        }
+
+        HAL_StatusTypeDef safety_status =
+            Servo_MotionSafetyPoll();
+
+        if (safety_status != HAL_OK)
+        {
+            Servo_MotionSafetyEnd();
+            return safety_status;
         }
 
         uint32_t elapsed = HAL_GetTick() - cycle_start;
@@ -792,7 +1029,6 @@ HAL_StatusTypeDef Servo_RunSynchronizedSmoothstep(
         }
     }
 
+    Servo_MotionSafetyEnd();
     return HAL_OK;
 }
-
-

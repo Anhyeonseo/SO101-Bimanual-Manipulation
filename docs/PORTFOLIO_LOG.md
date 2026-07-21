@@ -194,3 +194,56 @@
 
 - 아키텍처와 정적 연산 한도 검증 통과
 - 실제 UVC/Raspberry Pi 성능 측정 전까지 ADR-0007은 제안 상태
+
+---
+
+## 2026-07-21 — 카메라 선택적 decode와 STM32 제어 격리
+
+**목표**
+
+- 카메라 세 대의 RGB decode와 DDS 전달 부하가 Raspberry Pi 자원과 STM32 heartbeat·feedback을 방해하지 않는지 실기로 확인한다.
+
+**구현/시험**
+
+- 작업 phase에 따라 필요한 카메라만 JPEG decode하는 scheduler 구현
+- phase별 frame age와 decode 시간 p50/p95/max 진단 추가
+- `DUAL_PRIVATE`에서 top 6Hz, wrist A/B 각 5Hz RGB topic 동시 소비
+- STM32 bridge를 READ_ONLY, heartbeat 10Hz, joint feedback 5Hz로 동시 실행
+- CPU, memory, 온도, swap과 joint feedback 간격을 120초간 측정
+
+**측정 결과**
+
+| 지표 | 결과 |
+|---|---:|
+| package 시험 | 14 tests, 실패 0 |
+| phase별 목표 decode rate | 전부 일치 |
+| JPEG decode 실패 | 0회 |
+| frame age 전체 최댓값 | 35.98ms |
+| JPEG decode 전체 최댓값 | 6.31ms |
+| 부하 중 `/joint_states` | 5.008Hz |
+| joint feedback 최대 간격 | 201.30ms |
+| CPU 평균/1초 최대 | 6.38% / 8.73% |
+| memory 사용 최대 | 465.3MB |
+| 온도 최대 | 33.6°C |
+| swap in/out | 0/0 |
+| 시험 후 STM32 stop latch | 0 |
+
+**설계 판단**
+
+- 세 카메라는 capture를 유지하되 작업에 필요하지 않은 JPEG는 decode하지 않는다.
+- RGB 원본은 queue에 쌓지 않고 sensor-data QoS depth 1로 전달한다.
+- phase 전환 시 rolling 통계를 초기화해 서로 다른 작업 단계의 지연값이 섞이지 않게 한다.
+- 제어와 영상 처리는 서로 다른 process에서 실행하고 영상 부하 때문에 heartbeat rate를 낮추지 않는다.
+
+**증거**
+
+- `docs/test-results/2026-07-21-camera-phase-decode-latency.md`
+- `docs/test-results/2026-07-21-camera-decode-control-load.md`
+- `tools/camera_control_load_test.py`
+- `ros2_ws/src/manipulation_camera_manager`
+
+**완료 판정**
+
+- `CAM-003`, `CAM-005` 통과
+- `RES-001`의 capture + decode + DDS 하위 gate 통과
+- 실제 perception inference, MoveIt과 장시간 부하는 후속 단계에서 검증

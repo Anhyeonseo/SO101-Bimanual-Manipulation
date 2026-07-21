@@ -52,7 +52,7 @@
 | 실행 구조 | STM32 HAL 기반 main loop | 확정 | 현재 FreeRTOS 미사용 |
 | 현재 서보 연결 | USART1 단일 bus | 확정 | STS3215 ID 1~6 실기 검증 |
 | 양팔 확장 연결 | 팔별 독립 UART 또는 보드 분리 | 미정 | 양팔 하드웨어 확정 후 결정 |
-| 현재 펌웨어 | binary protocol v1 / `0x00020500` | 확정 | 실기 smoke·동작·SAFE_STOP 통과 |
+| 현재 펌웨어 | binary protocol v1 / `0x00020700` | 확정 | 실기 smoke·동작·SAFE_STOP·load/current·실제 위치 feedback 통과 |
 
 ## 카메라
 

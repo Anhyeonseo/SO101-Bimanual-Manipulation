@@ -3,7 +3,7 @@
   "capture": {
     "width": 640,
     "height": 480,
-    "fps": 15,
+    "fps": 30,
     "preferred_format": "MJPEG",
     "queue_depth": 1
   },
@@ -23,52 +23,51 @@
   "phases": {
     "STANDBY": {
       "top": {"decode_hz": 1, "inference_hz": 1},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 0, "inference_hz": 0},
       "policy_hz": 0
     },
     "SEARCH": {
       "top": {"decode_hz": 10, "inference_hz": 8},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 0, "inference_hz": 0},
       "policy_hz": 0
     },
     "APPROACH_RIGHT": {
       "top": {"decode_hz": 6, "inference_hz": 4},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 8, "inference_hz": 6},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 8, "inference_hz": 6},
       "policy_hz": 0
     },
     "VISUAL_ALIGN_RIGHT": {
       "top": {"decode_hz": 2, "inference_hz": 1},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 12, "inference_hz": 10},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 12, "inference_hz": 10},
       "policy_hz": 0
     },
     "TRANSFER_RIGHT": {
       "top": {"decode_hz": 3, "inference_hz": 2},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 2, "inference_hz": 1},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 2, "inference_hz": 1},
       "policy_hz": 0
     },
     "VERIFY_RIGHT": {
       "top": {"decode_hz": 6, "inference_hz": 4},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 6, "inference_hz": 4},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 6, "inference_hz": 4},
       "policy_hz": 0
     },
     "DUAL_PRIVATE": {
       "top": {"decode_hz": 6, "inference_hz": 4},
-      "left_wrist": {"decode_hz": 5, "inference_hz": 4},
-      "right_wrist": {"decode_hz": 5, "inference_hz": 4},
+      "wrist_a": {"decode_hz": 5, "inference_hz": 4},
+      "wrist_b": {"decode_hz": 5, "inference_hz": 4},
       "policy_hz": 0
     },
     "POLICY_ASSIST": {
       "top": {"decode_hz": 6, "inference_hz": 4},
-      "left_wrist": {"decode_hz": 0, "inference_hz": 0},
-      "right_wrist": {"decode_hz": 8, "inference_hz": 6},
+      "wrist_a": {"decode_hz": 0, "inference_hz": 0},
+      "wrist_b": {"decode_hz": 8, "inference_hz": 6},
       "policy_hz": 10
     }
   }
 }
-

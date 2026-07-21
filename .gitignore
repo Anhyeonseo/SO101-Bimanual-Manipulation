@@ -9,6 +9,9 @@ __pycache__/
 .venv/
 .venv-*/
 
+# Machine-local hardware overrides (copy the tracked *.example file)
+*.local.yaml
+
 # C/C++ / STM32
 *.o
 *.a
