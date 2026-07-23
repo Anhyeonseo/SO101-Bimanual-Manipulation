@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot name="so101_left" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="arm_slot" default="left"/>
+  <xacro:arg name="mount_xyz" default="0 0 0"/>
+  <xacro:arg name="mount_rpy" default="0 0 0"/>
+  <xacro:arg name="use_mock_hardware" default="false"/>
+
+  <xacro:include filename="so101_arm_macro.xacro"/>
+  <xacro:include filename="so101_ros2_control.xacro"/>
+
+  <material name="3d_printed">
+    <color rgba="1.0 0.82 0.12 1.0"/>
+  </material>
+  <material name="sts3215">
+    <color rgba="0.1 0.1 0.1 1.0"/>
+  </material>
+
+  <link name="workcell_base_link"/>
+
+  <xacro:so101_arm
+    prefix="$(arg arm_slot)_"
+    parent="workcell_base_link"
+    mount_xyz="$(arg mount_xyz)"
+    mount_rpy="$(arg mount_rpy)"
+  />
+
+  <xacro:if value="$(arg use_mock_hardware)">
+    <xacro:so101_mock_ros2_control
+      name="$(arg arm_slot)_system"
+      prefix="$(arg arm_slot)_"
+    />
+  </xacro:if>
+</robot>

@@ -247,3 +247,71 @@
 - `CAM-003`, `CAM-005` 통과
 - `RES-001`의 capture + decode + DDS 하위 gate 통과
 - 실제 perception inference, MoveIt과 장시간 부하는 후속 단계에서 검증
+
+---
+
+## 2026-07-24 — 왼팔 MoveIt·Isaac Sim 6.0.1 통합
+
+**목표**
+
+- 고장 난 반대편 팔을 제외하고 정상인 왼팔 하나의 simulation vertical
+  slice를 먼저 완성한다.
+- URDF/Xacro, MoveIt, controller action과 Isaac articulation이 동일한
+  joint 이름, radian, q0와 positive direction을 사용하게 한다.
+- 실제 STM32/servo를 활성화하지 않고 대표 trajectory를 검증한다.
+
+**구현/시험**
+
+- TheRobotStudio SO-101 geometry를 pinned commit 기준으로 가져와 왼팔
+  URDF/Xacro와 `ros2_control` mock interface 구성
+- `left_arm` 5-DOF, `left_gripper` 1-DOF SRDF와 KDL position-only IK 구성
+- mock controller에서 arm/gripper Plan/Execute 검증
+- Isaac Sim 6.0.1 stage에 articulation drive와 ROS 2 Joint States
+  OmniGraph 저장
+- project joint와 Isaac joint 사이의 sign/offset adapter 구현
+- MoveIt action을 Isaac `/isaac/joint_command`로 전달하고
+  `/isaac/joint_states`를 project `/joint_states`로 변환
+
+**측정 결과**
+
+| 지표 | 결과 |
+|---|---:|
+| mapping unit test | 3/3 통과 |
+| mock arm/gripper | 모두 Plan/Execute 성공 |
+| direct Isaac arm/gripper action | 모두 `SUCCEEDED` |
+| MoveIt → Isaac arm | random valid pose와 home 성공 |
+| MoveIt → Isaac gripper | open/closed 성공 |
+| home 후 최대 project joint 오차 | 약 `0.0097 rad` |
+| goal tolerance | `0.03 rad` |
+| 실제 servo 동작 | 0회 |
+
+**문제와 원인**
+
+- desktop에서 실행한 Isaac은 ROS library path가 없어 ROS 2 Bridge가
+  시작되지 않았다.
+- Isaac 6.0.1의 USD Python API와 Jazzy
+  `ParallelGripperCommand` feedback schema가 초기 가정과 달랐다.
+- bridge 종료 시 ROS context 이중 shutdown 예외가 있었다.
+
+**설계 판단**
+
+- Isaac Sim은 ROS 2 Jazzy 환경을 source한 terminal에서 시작한다.
+- 다섯 arm joint는 sign을 반전하고 gripper는 sign 유지와 `+10 deg`
+  project offset을 적용한다.
+- Isaac topic과 USD path는 `so101_isaac_bridge` 안에 격리하고 MoveIt
+  controller contract는 backend와 무관하게 유지한다.
+- 단일 왼팔 단계 4를 완료하되 양팔·camera mount는 검증 없이 PASS로
+  올리지 않는다.
+
+**증거**
+
+- `docs/checklists/PHASE_4_ISAAC_MOVEIT_INTEGRATION.md`
+- `docs/test-results/2026-07-24-isaac-moveit-left-arm-integration.md`
+- `ros2_ws/src/so101_isaac_bridge/test/test_mapping.py`
+- `isaac_sim/assets/so101_new_calib/so101_new_calib.usda`
+
+**완료 판정**
+
+- 단계 4 단일 왼팔 simulation vertical slice 통과
+- 실제 hardware는 비활성
+- 단계 5 실제 hardware 진입 전 safe limit과 backend 단일 선택 조건 검토

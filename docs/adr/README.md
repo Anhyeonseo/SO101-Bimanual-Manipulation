@@ -9,5 +9,6 @@
 | [0005](0005-camera-and-policy-staging.md) | 카메라와 policy 구현 순서 | 채택 |
 | [0006](0006-wire-protocol.md) | Pi–STM32 통신 규격 | 채택 |
 | [0007](0007-camera-compute-budget.md) | Pi 카메라와 연산 자원 한도 | 제안 |
+| [0008](0008-left-arm-first.md) | 정상인 왼팔 단일 팔 우선 | 채택 |
 
 기존 결정을 바꿔야 할 때는 문서를 삭제하지 않는다. 기존 문서를 `대체됨(Superseded)`으로 표시하고 새 ADR을 추가해 변경 이유를 남긴다.

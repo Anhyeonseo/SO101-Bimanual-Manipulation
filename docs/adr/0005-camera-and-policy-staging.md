@@ -12,10 +12,13 @@
 1. 카메라 3대의 영상 수집과 최신 frame scheduler
 2. 임시 영상 소비기(dummy consumer)를 이용한 Pi/USB 성능 측정
 3. Top 카메라를 이용한 평면 인식(perception)
-4. 오른팔의 재현 가능한 Pick and Place
+4. 현재 정상인 왼팔의 재현 가능한 Pick and Place
 5. 손목(Wrist) 카메라 Visual Servo
 6. 양팔의 재현 가능한 기준 동작(baseline)
 7. Isaac Lab의 구조화 상태(structured-state) policy
 8. 실제 명령을 내리지 않고 결과만 비교하는 shadow mode와 크기가 제한된 보정값(bounded residual)
 
 원본 영상을 직접 입력받는 policy가 안전을 담당하는 하위 제어 계층을 우회하지 않게 한다.
+
+2026-07-24에 단일 팔 side를 왼팔로 확정했다. 구현 순서는 유지하며 side
+선정 근거는 [ADR-0008](0008-left-arm-first.md)에 기록한다.

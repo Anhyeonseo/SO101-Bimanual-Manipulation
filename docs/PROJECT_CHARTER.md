@@ -17,7 +17,7 @@
 
 ### 1차 범위
 
-- 오른팔 5DOF와 gripper
+- 현재 정상인 왼팔 5DOF와 gripper
 - 고정 작업대의 검은색 마커펜 검출
 - Top 카메라 기반 평면 `x, y, yaw` 추정
 - 넓은 펜꽂이로 Pick and Place

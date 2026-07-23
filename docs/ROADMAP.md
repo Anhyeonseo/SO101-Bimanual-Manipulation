@@ -40,14 +40,17 @@
 
 ## 단계 4 — MoveIt/Isaac Sim 기구학 검증
 
-- 오른팔·왼팔·양팔 planning group
+- 정상인 왼팔 단일 planning group을 먼저 검증
 - 충돌 모델, 작업 가능 공간(workspace) 계산, 공유·개별 작업 영역
 - Isaac Sim에 URDF를 불러오고 카메라 mount 검증
 - 완료 조건: 모의 하드웨어와 Isaac 환경에서 대표 trajectory 검증
+- 2026-07-24 판정: 왼팔 arm/gripper 대표 trajectory까지 통과. 반대편 팔,
+  양팔 planning group, 공유 workspace와 simulated camera mount는 해당
+  하드웨어 복구 및 측정 후 후속 gate로 유지
 
-## 단계 5 — 실제 오른팔 제어
+## 단계 5 — 실제 왼팔 제어
 
-- JTC → ros2_control → STM32 → 오른팔
+- JTC → ros2_control → STM32 → 현재 정상인 왼팔
 - 단일 관절, 전체 팔, home, 취소, fault 복구
 - 완료 조건: 반복 trajectory와 통신 단절 시험 통과
 
@@ -60,7 +63,7 @@
 
 ## 단계 7 — 재현 가능한 Pick and Place
 
-- 오른팔 상태 머신
+- 왼팔 상태 머신
 - grasp/place 검증
 - 50회 반복 시험
 - 완료 조건: Pick/Place 각각 90% 이상, 비명령 동작·충돌 0회

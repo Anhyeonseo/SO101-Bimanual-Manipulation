@@ -4,6 +4,7 @@
 
 | 구성 요소 | 위치 | License |
 |---|---|---|
+| TheRobotStudio SO-101 URDF geometry and STL meshes (commit `fda892cba81032c46c40976a48c9ceadbf40a9ca`) | `ros2_ws/src/so101_description` | Apache-2.0; package README and root `LICENSE` 참조 |
 | ARM CMSIS Core | `firmware/stm32_g474_single_arm/Drivers/CMSIS` | Apache-2.0, 해당 디렉터리의 `LICENSE.txt` 참조 |
 | STM32G4 CMSIS Device | `firmware/stm32_g474_single_arm/Drivers/CMSIS/Device/ST/STM32G4xx` | Apache-2.0, 해당 디렉터리의 `LICENSE.txt` 참조 |
 | STM32G4 HAL Driver | `firmware/stm32_g474_single_arm/Drivers/STM32G4xx_HAL_Driver` | BSD-3-Clause, 해당 디렉터리의 `LICENSE.txt` 참조 |
