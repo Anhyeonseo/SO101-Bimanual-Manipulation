@@ -50,9 +50,12 @@
 
 ## 단계 5 — 실제 왼팔 제어
 
-- JTC → ros2_control → STM32 → 현재 정상인 왼팔
+- 초기 B안: MoveIt standard Action → `single_arm_bridge` → STM32 → 정상인 왼팔
+- ros2_control hardware interface 전환은 multi-point 계약과 함께 후속 확장
 - 단일 관절, 전체 팔, home, 취소, fault 복구
 - 완료 조건: 반복 trajectory와 통신 단절 시험 통과
+- 2026-07-25 판정: single-point arm/gripper, cancel, SAFE_STOP, 명시적
+  recovery, reconnect stale-goal 방지와 MoveIt end-to-end 실기 통과
 
 ## 단계 6 — Top 카메라 인식(Perception)
 

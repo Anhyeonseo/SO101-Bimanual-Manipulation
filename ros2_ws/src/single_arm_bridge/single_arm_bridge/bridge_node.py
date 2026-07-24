@@ -2,20 +2,39 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
 import sys
 import time
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+
 from sensor_msgs.msg import JointState
+
 from std_srvs.srv import Trigger
+
 from trajectory_msgs.msg import JointTrajectory
 
+from .action_execution import MotionExecutionCore
+from .backend_lease import acquire_backend_lease
 from .calibration import load_calibration
 from .device_discovery import resolve_serial_device
-from .transport import ActuatorTransport, TransportError
+from .follow_joint_trajectory_server import FollowJointTrajectoryActionAdapter
+from .hardware_identity import validate_hardware_identity
+from .motion_goal_arbiter import MotionGoalArbiter
+from .parallel_gripper_command_server import (
+    ParallelGripperCommandActionAdapter,
+)
+from .serial_port import open_exclusive_serial
+from .transport import (
+    ActuatorTransport,
+    StateResponseDeferred,
+    TransportError,
+)
 
 
 DEFAULT_DEVICE = "auto"
@@ -35,9 +54,6 @@ class SingleArmBridge(Node):
         self.declare_parameter("allow_motion", False)
         self.declare_parameter("calibration_file", default_calibration)
 
-        serial_device = resolve_serial_device(
-            str(self.get_parameter("serial_device").value)
-        )
         baud_rate = self.get_parameter("baud_rate").value
         feedback_rate = self.get_parameter("feedback_rate_hz").value
         self._allow_motion = bool(self.get_parameter("allow_motion").value)
@@ -46,45 +62,55 @@ class SingleArmBridge(Node):
         if not 1.0 <= feedback_rate <= 10.0:
             raise ValueError("feedback_rate_hz must be within 1..10")
 
-        self._calibration = load_calibration(calibration_file)
         self._faulted = False
         self._consecutive_errors = 0
         self._feedback_resume_at = 0.0
         self._motion_armed = False
+        self._serial = None
+        self._backend_lease = None
+        self._arm_action_adapter = None
+        self._gripper_action_adapter = None
+        self._motion_arbiter = MotionGoalArbiter()
+        self._latest_positions: tuple[float, ...] | None = None
+        self._latest_feedback_at = 0.0
+        self._feedback_max_age_s = max(0.5, 2.5 / feedback_rate)
 
         try:
+            ros_domain_id = int(os.environ.get("ROS_DOMAIN_ID", "0"))
+            self._backend_lease = acquire_backend_lease("stm32", ros_domain_id)
+            serial_device = resolve_serial_device(
+                str(self.get_parameter("serial_device").value)
+            )
+            self._calibration = load_calibration(calibration_file)
+
             import serial
 
-            self._serial = serial.Serial(
+            self._serial = open_exclusive_serial(
+                serial,
                 serial_device,
                 baud_rate,
-                timeout=0.12,
-                write_timeout=0.12,
+                timeout_s=0.12,
             )
             self._transport = ActuatorTransport(
                 self._serial,
                 response_timeout_s=0.12,
             )
             hello = self._transport.enter_binary_mode()
-        except Exception as error:
-            raise RuntimeError(f"STM32 connection failed: {error}") from error
-
-        if hello.calibration_hash != self._calibration.calibration_hash:
-            self._serial.close()
-            raise RuntimeError(
-                "calibration hash mismatch: "
-                f"MCU=0x{hello.calibration_hash:08X}, "
-                f"host=0x{self._calibration.calibration_hash:08X}"
+            validate_hardware_identity(
+                hello,
+                self._calibration.calibration_hash,
             )
-
-        if self._allow_motion:
-            if hello.stop_latched:
-                self.get_logger().warning(
-                    "STM32 stop is latched; inspect the arm and call /clear_fault"
-                )
-            else:
-                self._transport.arm_and_enable(self._calibration.calibration_hash)
-                self._motion_armed = True
+            self._execution_core = MotionExecutionCore(
+                self._transport,
+                hello,
+                self._calibration,
+            )
+        except Exception as error:
+            if self._serial is not None and self._serial.is_open:
+                self._serial.close()
+            if self._backend_lease is not None:
+                self._backend_lease.release()
+            raise RuntimeError(f"STM32 connection failed: {error}") from error
 
         self._joint_publisher = self.create_publisher(
             JointState,
@@ -107,6 +133,57 @@ class SingleArmBridge(Node):
             1.0 / feedback_rate,
             self._publish_feedback,
         )
+        arm_attempted = False
+        try:
+            if self._allow_motion:
+                self._arm_action_adapter = FollowJointTrajectoryActionAdapter(
+                    self,
+                    self._execution_core,
+                    self._calibration,
+                    self._motion_backend_ready,
+                    self._fresh_joint_positions,
+                    motion_arbiter=self._motion_arbiter,
+                )
+                self._gripper_action_adapter = (
+                    ParallelGripperCommandActionAdapter(
+                        self,
+                        self._execution_core,
+                        self._calibration,
+                        self._motion_backend_ready,
+                        self._fresh_joint_positions,
+                        motion_arbiter=self._motion_arbiter,
+                    )
+                )
+                if hello.stop_latched:
+                    self.get_logger().warning(
+                        "STM32 stop is latched; inspect the arm and call "
+                        "/clear_fault"
+                    )
+                else:
+                    arm_attempted = True
+                    self._transport.arm_and_enable(
+                        self._calibration.calibration_hash
+                    )
+                    self._motion_armed = True
+        except Exception as error:
+            if arm_attempted:
+                try:
+                    self._transport.safe_stop()
+                except Exception:
+                    pass
+            if self._arm_action_adapter is not None:
+                self._arm_action_adapter.destroy()
+                self._arm_action_adapter = None
+            if self._gripper_action_adapter is not None:
+                self._gripper_action_adapter.destroy()
+                self._gripper_action_adapter = None
+            if self._serial is not None and self._serial.is_open:
+                self._serial.close()
+            if self._backend_lease is not None:
+                self._backend_lease.release()
+            raise RuntimeError(
+                f"STM32 motion initialization failed: {error}"
+            ) from error
 
         if self._motion_armed:
             mode = "MOTION_ENABLED"
@@ -132,6 +209,12 @@ class SingleArmBridge(Node):
             return
         if time.monotonic() < self._feedback_resume_at:
             return
+        if self._execution_core.active:
+            # Firmware trajectory execution owns the servo bus. The Action
+            # polling thread collects its unsolicited terminal status; resume
+            # physical position reads on the first regular cycle after it ends.
+            self._consecutive_errors = 0
+            return
         try:
             state = self._transport.get_state(include_positions=True)
             if state.stop_latched:
@@ -142,14 +225,26 @@ class SingleArmBridge(Node):
                 )
                 return
             assert state.raw_positions is not None
+            positions = tuple(
+                self._calibration.raw_feedback_to_radians(state.raw_positions)
+            )
+            self._latest_positions = positions
+            self._latest_feedback_at = time.monotonic()
             message = JointState()
             message.header.stamp = self.get_clock().now().to_msg()
             message.name = self._calibration.ros_joint_names
-            message.position = self._calibration.raw_feedback_to_radians(
-                state.raw_positions
-            )
+            message.position = list(positions)
             self._joint_publisher.publish(message)
-            self._process_motion_results()
+            if (
+                self._arm_action_adapter is None
+                and self._gripper_action_adapter is None
+            ):
+                self._process_motion_results()
+            self._consecutive_errors = 0
+        except StateResponseDeferred:
+            # A terminal motion result is valid serial traffic. The MCU can omit
+            # the overlapping position response while final verification ends;
+            # the next regular 5 Hz cycle will obtain fresh joint state.
             self._consecutive_errors = 0
         except Exception as error:
             self._handle_transport_error("feedback", error)
@@ -172,6 +267,14 @@ class SingleArmBridge(Node):
             )
 
     def _on_joint_command(self, message: JointTrajectory) -> None:
+        if (
+            self._arm_action_adapter is not None
+            or self._gripper_action_adapter is not None
+        ):
+            self.get_logger().error(
+                "joint command rejected: standard Actions own motion"
+            )
+            return
         if not self._allow_motion or self._faulted or not self._motion_armed:
             self.get_logger().error("joint command rejected: motion is not enabled")
             return
@@ -207,10 +310,21 @@ class SingleArmBridge(Node):
     def _on_clear_fault(self, request: Trigger.Request, response: Trigger.Response):
         del request
         try:
+            if self._execution_core.active or self._motion_arbiter.owner is not None:
+                raise RuntimeError("cannot clear fault while an Action goal is active")
             self._transport.clear_fault()
+            hello = self._transport.enter_binary_mode()
+            validate_hardware_identity(
+                hello,
+                self._calibration.calibration_hash,
+            )
             if self._allow_motion:
                 self._transport.arm_and_enable(self._calibration.calibration_hash)
                 self._motion_armed = True
+            self._execution_core.replace_transport_after_explicit_recovery(
+                self._transport,
+                hello,
+            )
             self._faulted = False
             self._consecutive_errors = 0
             response.success = True
@@ -221,6 +335,12 @@ class SingleArmBridge(Node):
             )
             self.get_logger().info(response.message)
         except Exception as error:
+            self._motion_armed = False
+            self._faulted = True
+            try:
+                self._transport.safe_stop()
+            except Exception:
+                pass
             response.success = False
             response.message = f"fault clear rejected: {error}"
             self.get_logger().error(response.message)
@@ -242,12 +362,27 @@ class SingleArmBridge(Node):
         self.get_logger().error(f"{stage} error: {error}")
         self._faulted = True
         self._motion_armed = False
+        if self._arm_action_adapter is not None:
+            self._arm_action_adapter.notify_connection_loss(
+                f"{stage}: {error}"
+            )
+        if self._gripper_action_adapter is not None:
+            self._gripper_action_adapter.notify_connection_loss(
+                f"{stage}: {error}"
+            )
         try:
             self._transport.safe_stop()
         except Exception as stop_error:
             self.get_logger().error(f"SAFE_STOP acknowledgement failed: {stop_error}")
 
     def destroy_node(self) -> bool:
+        self.prepare_shutdown()
+        if self._arm_action_adapter is not None:
+            self._arm_action_adapter.destroy()
+            self._arm_action_adapter = None
+        if self._gripper_action_adapter is not None:
+            self._gripper_action_adapter.destroy()
+            self._gripper_action_adapter = None
         if (
             hasattr(self, "_transport")
             and self._allow_motion
@@ -274,20 +409,51 @@ class SingleArmBridge(Node):
                     self.get_logger().error(message)
                 else:
                     print(message, file=sys.stderr)
-        if hasattr(self, "_serial") and self._serial.is_open:
+        if self._serial is not None and self._serial.is_open:
             self._serial.close()
+        if self._backend_lease is not None:
+            self._backend_lease.release()
         return super().destroy_node()
+
+    def _motion_backend_ready(self) -> bool:
+        return (
+            self._allow_motion
+            and self._motion_armed
+            and not self._faulted
+            and not self._execution_core.blocked
+        )
+
+    def _fresh_joint_positions(self) -> tuple[float, ...] | None:
+        positions = self._latest_positions
+        if positions is None:
+            return None
+        if time.monotonic() - self._latest_feedback_at > self._feedback_max_age_s:
+            return None
+        return positions
+
+    def prepare_shutdown(self) -> None:
+        if self._arm_action_adapter is not None:
+            self._arm_action_adapter.notify_connection_loss("node shutdown")
+        if self._gripper_action_adapter is not None:
+            self._gripper_action_adapter.notify_connection_loss("node shutdown")
 
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = None
+    executor = None
     try:
         node = SingleArmBridge()
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        if node is not None:
+            node.prepare_shutdown()
+        if executor is not None:
+            executor.shutdown(timeout_sec=2.0)
         if node is not None:
             node.destroy_node()
         if rclpy.ok():

@@ -22,6 +22,9 @@
   <group_state name="open" group="left_gripper">
     <joint name="left_gripper_joint" value="1.91986"/>
   </group_state>
+  <group_state name="hardware_safe_open" group="left_gripper">
+    <joint name="left_gripper_joint" value="0.08"/>
+  </group_state>
 
   <end_effector
     name="left_end_effector"

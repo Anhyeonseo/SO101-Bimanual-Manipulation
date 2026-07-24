@@ -16,10 +16,11 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>moveit_configs_utils</exec_depend>
-  <exec_depend>so101_moveit_config</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>single_arm_bridge</exec_depend>
   <exec_depend>so101_description</exec_depend>
   <exec_depend>so101_isaac_bridge</exec_depend>
+  <exec_depend>so101_moveit_config</exec_depend>
   <exec_depend>xacro</exec_depend>
 
   <export>

@@ -315,3 +315,61 @@
 - 단계 4 단일 왼팔 simulation vertical slice 통과
 - 실제 hardware는 비활성
 - 단계 5 실제 hardware 진입 전 safe limit과 backend 단일 선택 조건 검토
+
+---
+
+## 2026-07-25 — 단계 5 실제 왼팔 MoveIt·STM32 통합
+
+**목표**
+
+- Pi가 STM32 serial을 단독 소유하고 워크스테이션 MoveIt이 표준 controller
+  Action으로 실제 왼팔을 제어한다.
+- cancel, SAFE_STOP, 명시적 recovery와 reconnect 뒤 stale goal 방지를
+  실제 hardware에서 확인한다.
+- 초기 B안은 검증된 single-point만 허용하고 multi-point 확장은 분리한다.
+
+**구현/시험**
+
+- Jazzy `FollowJointTrajectory`와 `ParallelGripperCommand` Action adapter 구현
+- calibration hash와 strict raw range, no-clamp, default READ_ONLY gate 유지
+- active motion 동안 servo bus와 충돌하는 `GET_STATE`를 일시 정지하고 완료 뒤
+  정규 5 Hz feedback 자동 복귀
+- 워크스테이션 전용 `external_stm32_moveit.launch.py`와 one-shot MoveIt 실행
+  도구 추가
+- arm q0, 0.05 rad, 0.10 rad와 gripper 0.08 rad 실제 MoveIt 경유 실행
+- gripper cancel 뒤 SAFE_STOP latch와 사용자 승인 recovery 실행
+- process 재시작 뒤 5초간 이전 goal 재개·재전송 0회 확인
+
+**측정 결과**
+
+| 지표 | 결과 |
+|---|---:|
+| Python 회귀 | 116/116 통과 |
+| ROS workspace build | 6 packages 통과 |
+| `/joint_states` | 5.000 Hz |
+| representative arm 최대 final error | 18 raw |
+| visible arm 최대 final error | 15 raw |
+| gripper final error | 약 5 raw |
+| 허용 final error | 20 raw |
+| cancel Action status | CANCELED |
+| reconnect stale goal | 0회 |
+| MoveIt/bridge 실기 WARN·ERROR | 0회 |
+
+**설계 판단**
+
+- 현재 B안 single-point 계약을 단계 5 완료 기준으로 유지한다.
+- 일반 OMPL multi-point 실행은 firmware queue/streaming 또는 ros2_control
+  hardware interface 계약을 구현한 뒤 확장한다.
+- 실제 Pick and Place는 단계 6 perception 정확도 gate 뒤 단계 7에서 진행한다.
+
+**증거**
+
+- `docs/test-results/2026-07-25-phase5-stm32-read-only.md`
+- `docs/checklists/PHASE_5_LEFT_ARM_HARDWARE_BACKEND.md`
+- `tools/ros_moveit_execute_once.py`
+
+**완료 판정**
+
+- 단계 5 초기 B안 single-point hardware milestone 통과
+- 실제 로봇 q0 원복, MoveIt/Pi bridge 종료와 servo power OFF 완료
+- 다음 단계: 단계 6 Top 카메라 인식

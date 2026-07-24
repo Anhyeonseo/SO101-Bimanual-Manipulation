@@ -1,9 +1,10 @@
 import json
-from pathlib import Path
 import struct
 import sys
 import tempfile
+import time
 import unittest
+from pathlib import Path
 
 
 PACKAGE_ROOT = Path("ros2_ws/src/single_arm_bridge")
@@ -17,7 +18,10 @@ from single_arm_bridge.protocol import (  # noqa: E402
     decode_frame,
     encode_frame,
 )
-from single_arm_bridge.transport import ActuatorTransport  # noqa: E402
+from single_arm_bridge.transport import (  # noqa: E402
+    ActuatorTransport,
+    StateResponseDeferred,
+)
 
 
 CALIBRATION_PATH = PACKAGE_ROOT / "config" / "single_arm_calibration.json"
@@ -28,11 +32,45 @@ class FakeSerial:
         self,
         already_binary: bool = False,
         include_async_result: bool = False,
+        async_result_delay_s: float = 0.0,
+        drop_state_after_async_result: bool = False,
+        terminal_before_safe_stop_ack: bool = False,
     ) -> None:
         self._responses: list[bytes] = []
         self._ascii_response = b""
         self._already_binary = already_binary
         self._include_async_result = include_async_result
+        self._async_result_delay_s = async_result_delay_s
+        self._drop_state_after_async_result = drop_state_after_async_result
+        self._terminal_before_safe_stop_ack = terminal_before_safe_stop_ack
+        self._delay_next_async_result = False
+        self._async_result_sent = False
+        self.get_state_request_count = 0
+
+    @property
+    def in_waiting(self) -> int:
+        return sum(len(response) for response in self._responses)
+
+    def queue_terminal_motion_result(self) -> None:
+        self._responses.append(
+            encode_frame(
+                Frame(
+                    message_type=MessageType.SETPOINT_STATUS,
+                    sequence=77,
+                    sender_time_ms=1200,
+                    payload=struct.pack(
+                        "<BBBBIII",
+                        6,
+                        1,
+                        3,
+                        4,
+                        77,
+                        1200,
+                        0x3DB42B48,
+                    ),
+                )
+            )
+        )
 
     def reset_input_buffer(self) -> None:
         self._responses.clear()
@@ -63,7 +101,12 @@ class FakeSerial:
             )
             response_type = MessageType.HELLO_RESPONSE
         elif request.message_type is MessageType.GET_STATE:
-            if self._include_async_result:
+            self.get_state_request_count += 1
+            emit_async_result = (
+                self._include_async_result
+                and not self._async_result_sent
+            )
+            if emit_async_result:
                 self._responses.append(
                     encode_frame(
                         Frame(
@@ -83,6 +126,10 @@ class FakeSerial:
                         )
                     )
                 )
+                self._async_result_sent = True
+            self._delay_next_async_result = emit_async_result
+            if emit_async_result and self._drop_state_after_async_result:
+                return len(data)
             payload = struct.pack(
                 "<BBBBIIII6H",
                 0,
@@ -99,6 +146,34 @@ class FakeSerial:
                 2047,
                 2051,
                 2045,
+            )
+            response_type = MessageType.STATE_FEEDBACK
+        elif request.message_type is MessageType.SETPOINT_BATCH:
+            apply_tick = struct.unpack_from("<I", request.payload)[0]
+            payload = struct.pack(
+                "<BBBBIII",
+                0,
+                1,
+                3,
+                0,
+                request.sequence,
+                apply_tick,
+                0x3DB42B48,
+            )
+            response_type = MessageType.SETPOINT_STATUS
+        elif request.message_type is MessageType.SAFE_STOP:
+            if self._terminal_before_safe_stop_ack:
+                self.queue_terminal_motion_result()
+            payload = struct.pack(
+                "<BBBBIIII",
+                1,
+                0,
+                6,
+                1,
+                4,
+                0,
+                0x3DB42B48,
+                1200,
             )
             response_type = MessageType.STATE_FEEDBACK
         elif request.message_type is MessageType.CLEAR_FAULT:
@@ -136,6 +211,9 @@ class FakeSerial:
 
     def read_until(self, delimiter: bytes) -> bytes:
         del delimiter
+        if self._delay_next_async_result:
+            self._delay_next_async_result = False
+            time.sleep(self._async_result_delay_s)
         return self._responses.pop(0) if self._responses else b""
 
 
@@ -217,17 +295,59 @@ class SingleArmBridgeCoreTests(unittest.TestCase):
         hello = transport.enter_binary_mode()
         self.assertEqual(hello.capabilities, 0x0000000F)
 
-    def test_transport_preserves_async_motion_completion(self) -> None:
-        transport = ActuatorTransport(
-            FakeSerial(include_async_result=True),
-            response_timeout_s=0.01,
-        )
+    def test_transport_collects_unsolicited_motion_completion(self) -> None:
+        serial = FakeSerial()
+        transport = ActuatorTransport(serial, response_timeout_s=0.01)
         transport.enter_binary_mode()
-        transport.get_state(include_positions=True)
+        serial.queue_terminal_motion_result()
         results = transport.drain_motion_results()
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].status_code, 6)
         self.assertEqual(results[0].detail, 4)
+        self.assertEqual(serial.get_state_request_count, 0)
+
+    def test_async_result_defers_state_to_next_feedback_cycle(self) -> None:
+        serial = FakeSerial(
+            include_async_result=True,
+            async_result_delay_s=0.015,
+            drop_state_after_async_result=True,
+        )
+        transport = ActuatorTransport(
+            serial,
+            response_timeout_s=0.01,
+        )
+        transport.enter_binary_mode()
+        with self.assertRaises(StateResponseDeferred):
+            transport.get_state(include_positions=True)
+        results = transport.drain_motion_results()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status_code, 6)
+        self.assertEqual(serial.get_state_request_count, 1)
+        state = transport.get_state(include_positions=True)
+        self.assertIsNotNone(state.raw_positions)
+        self.assertEqual(serial.get_state_request_count, 2)
+
+    def test_transport_returns_setpoint_acceptance_identity(self) -> None:
+        transport = ActuatorTransport(FakeSerial(), response_timeout_s=0.01)
+        transport.enter_binary_mode()
+        accepted = transport.send_setpoint([0] * 6, 300)
+        self.assertEqual(accepted.status_code, 0)
+        self.assertEqual(accepted.sample_count, 1)
+        self.assertEqual(accepted.safety_state, 3)
+        self.assertGreater(accepted.request_sequence, 0)
+        self.assertEqual(accepted.apply_tick_ms, 1500)
+        self.assertEqual(accepted.calibration_hash, 0x3DB42B48)
+
+    def test_safe_stop_ack_survives_interleaved_terminal_result(self) -> None:
+        transport = ActuatorTransport(
+            FakeSerial(terminal_before_safe_stop_ack=True),
+            response_timeout_s=0.01,
+        )
+        transport.enter_binary_mode()
+        transport.safe_stop()
+        results = transport.drain_motion_results()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status_code, 6)
 
     def test_transport_clear_fault_requires_unlatched_success(self) -> None:
         transport = ActuatorTransport(FakeSerial(), response_timeout_s=0.01)

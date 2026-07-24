@@ -18,6 +18,7 @@
 | ISAAC-001 | 단계 4 | Isaac articulation | 6 joint 안정 유지, state/command round trip | 통과 | [단계 4 통합 결과](test-results/2026-07-24-isaac-moveit-left-arm-integration.md) |
 | ISAAC-002 | 단계 4 | MoveIt → Isaac trajectory | arm random pose, gripper open/closed, home 성공 | 통과 | [단계 4 통합 결과](test-results/2026-07-24-isaac-moveit-left-arm-integration.md) |
 | ISAAC-003 | 단계 4 | 실제 hardware 격리 | serial/STM32 접근과 실제 servo 동작 0 | 통과 | [단계 4 통합 결과](test-results/2026-07-24-isaac-moveit-left-arm-integration.md) |
+| MOVEIT-003 | 단계 5 | MoveIt → STM32 single-point | home, arm, gripper와 feedback 성공 | 통과 | [단계 5 실기 결과](test-results/2026-07-25-phase5-stm32-read-only.md) |
 | MCU-001 | 단계 2 | packet 해석기 | 절단/CRC/길이 오류 거부 | 통과 | [바이너리 제어 경로 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
 | MCU-002 | 단계 2 | heartbeat 단절 | 정의된 시간 안에 안전 정지 | 통과 | [바이너리 제어 경로 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
 | MCU-003 | 단계 2 | 제어 loop | overrun/underflow 0 | 미실행 | 여러 sample queue 구현 후 시험 |
@@ -29,8 +30,8 @@
 | CAM-005 | 단계 3 | frame 최신성 | 상태별 p95/max 기록 | 통과 | [phase scheduler·선택적 decode 결과](test-results/2026-07-21-camera-phase-decode-latency.md) |
 | RES-001 | 단계 3/9 | Pi 자원 한도 | CPU/memory/temperature 기준 충족 | 부분 통과 | [decode·DDS 부하 결과](test-results/2026-07-21-camera-decode-control-load.md) 통과, 실제 inference·MoveIt·장시간 부하는 미실행 |
 | POL-001 | 단계 11 | structured policy 실행 | raw image 입력 없음, deadline 기록 | 미실행 |  |
-| MOT-001 | 단계 5 | 단일 시험 왼팔 trajectory | 반복 실행 성공 | 통과 | [6축 OUT/HOME 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
-| MOT-002 | 단계 5 | 취소/정지 | 정해진 안전 상태 진입 | 통과 | [이동 중 SAFE_STOP 결과](test-results/2026-07-20-stm32-binary-control-plane.md) |
+| MOT-001 | 단계 5 | 단일 시험 왼팔 trajectory | 반복 실행 성공 | 통과 | [단계 5 실기 결과](test-results/2026-07-25-phase5-stm32-read-only.md) |
+| MOT-002 | 단계 5 | 취소/정지 | 정해진 안전 상태 진입 | 통과 | [단계 5 실기 결과](test-results/2026-07-25-phase5-stm32-read-only.md) |
 | VIS-001 | 단계 6 | 작업대 위치 추정 | grasp 허용 오차 이내 | 미실행 |  |
 | TASK-001 | 단계 7 | Pick | 50회 중 90% 이상 | 미실행 |  |
 | TASK-002 | 단계 7 | Place | 50회 중 90% 이상 | 미실행 |  |

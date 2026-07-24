@@ -1,5 +1,13 @@
 from launch import LaunchDescription
-from launch.substitutions import Command, FindExecutable, PathJoinSubstitution
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.substitutions import (
+    Command,
+    FindExecutable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+)
+
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -28,10 +36,21 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "start_robot_state_publisher",
+                default_value="true",
+                description=(
+                    "Start robot_state_publisher when this launch is used "
+                    "standalone"
+                ),
+            ),
             Node(
                 package="robot_state_publisher",
                 executable="robot_state_publisher",
                 parameters=[robot_description],
+                condition=IfCondition(
+                    LaunchConfiguration("start_robot_state_publisher")
+                ),
                 output="screen",
             ),
             Node(
@@ -39,26 +58,41 @@ def generate_launch_description():
                 executable="ros2_control_node",
                 parameters=[controllers_file],
                 remappings=[
-                    ("/controller_manager/robot_description", "/robot_description")
+                    (
+                        "/controller_manager/robot_description",
+                        "/robot_description",
+                    )
                 ],
                 output="screen",
             ),
             Node(
                 package="controller_manager",
                 executable="spawner",
-                arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
+                arguments=[
+                    "joint_state_broadcaster",
+                    "--controller-manager",
+                    "/controller_manager",
+                ],
                 output="screen",
             ),
             Node(
                 package="controller_manager",
                 executable="spawner",
-                arguments=["left_arm_controller", "--controller-manager", "/controller_manager"],
+                arguments=[
+                    "left_arm_controller",
+                    "--controller-manager",
+                    "/controller_manager",
+                ],
                 output="screen",
             ),
             Node(
                 package="controller_manager",
                 executable="spawner",
-                arguments=["left_gripper_controller", "--controller-manager", "/controller_manager"],
+                arguments=[
+                    "left_gripper_controller",
+                    "--controller-manager",
+                    "/controller_manager",
+                ],
                 output="screen",
             ),
         ]
