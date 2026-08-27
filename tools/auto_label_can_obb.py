@@ -10,12 +10,17 @@ import math
 from pathlib import Path
 import random
 import shutil
+import sys
 
 import cv2
 import numpy as np
 
 from object_pose_dataset import atomic_write_json, file_sha256, load_json
-from bootstrap_top_pen_obb_labels import (
+PEN_TRAINING_TOOLS = Path(__file__).resolve().parent / "setup" / "pen_detector_training"
+if str(PEN_TRAINING_TOOLS) not in sys.path:
+    sys.path.insert(0, str(PEN_TRAINING_TOOLS))
+
+from bootstrap_top_pen_obb_labels import (  # noqa: E402
     draw_review,
     label_text as pen_obb_label_text,
     order_box_points,

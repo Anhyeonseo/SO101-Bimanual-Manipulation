@@ -187,7 +187,7 @@ def test_height_check_has_no_close_command_and_returns_to_q0() -> None:
 
 
 def test_shared_resident_helpers_allow_a_dedicated_owner() -> None:
-    shared = (TOOLS / "run_top_pick_place_application_once.py").read_text(
+    shared = (TOOLS / "run" / "run_top_pick_place_application_once.py").read_text(
         encoding="utf-8"
     )
     assert "owner: str = OWNER" in shared

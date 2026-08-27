@@ -1,0 +1,1612 @@
+#!/usr/bin/env python3
+"""Select one arm from camera pixels and build a fresh non-executable plan."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from hashlib import sha256
+import json
+import math
+import os
+from pathlib import Path
+from statistics import median
+import sys
+import tempfile
+import time
+
+import numpy as np
+from scipy.optimize import least_squares
+import yaml
+
+ROOT = Path(__file__).resolve().parents[2]
+for source_path in (
+    ROOT / "tools" / "lib",
+    ROOT / "ros2_ws" / "src" / "so101_top_perception",
+):
+    if str(source_path) not in sys.path:
+        sys.path.insert(0, str(source_path))
+
+from geometry_msgs.msg import Pose  # noqa: E402
+from moveit_msgs.msg import (  # noqa: E402
+    Constraints,
+    JointConstraint,
+    MoveItErrorCodes,
+    PositionConstraint,
+    RobotState,
+)
+from moveit_msgs.srv import GetMotionPlan, GetPositionFK  # noqa: E402
+import rclpy  # noqa: E402
+from rclpy.node import Node  # noqa: E402
+from sensor_msgs.msg import JointState  # noqa: E402
+from shape_msgs.msg import SolidPrimitive  # noqa: E402
+from so101_interfaces.msg import TopObjectPose  # noqa: E402
+
+from so101_top_perception.shadow_target import (  # noqa: E402
+    BoardObservation,
+    ShadowTargetError,
+    evaluate_shadow,
+    load_shadow_config,
+    source_stamp_age_seconds,
+)
+from top_pick_place_application import (  # noqa: E402
+    ARM_JOINTS_BY_SIDE,
+    CANONICAL_JOINTS,
+    CONTACT_THRESHOLD_RAW,
+    DEFAULT_CAMERA_CENTER_DEADBAND_PX,
+    BaseTargetSample,
+    lock_target,
+    require_consistent_arm_selection,
+    select_arm_for_pixel,
+    sha256_file,
+    workspace_coordinates_for_arm,
+)
+from grasp_yaw_kinematics import (  # noqa: E402
+    GraspYawKinematics,
+    wrap_half_turn,
+)
+
+
+STATUS = "DYNAMIC_TOP_PICK_PLACE_PLAN_ONLY_PASS"
+TARGET_TOPIC = "/perception/top/object_pose_board"
+CAN_TARGET_TOPIC = "/perception/top/can_obb/object_pose_board"
+PLAN_SERVICE = "/plan_kinematic_path"
+FK_SERVICE = "/compute_fk"
+WORKCELL_FRAME = "workcell_base_link"
+Q0 = (0.0,) * 5
+MAX_JOINT_STEP_RAD = 0.18
+JOINT_GOAL_TOLERANCE_RAD = 0.0005
+PICK_PREGRASP_OFFSET_M = 0.100
+BASELINE_PICK_GRASP_OFFSET_M = 0.011
+PREVIOUS_PICK_GRASP_OFFSET_M = 0.002
+PICK_GRASP_OFFSET_M = -0.001
+PICK_GRASP_DOWNWARD_ADJUSTMENT_M = (
+    PREVIOUS_PICK_GRASP_OFFSET_M - PICK_GRASP_OFFSET_M
+)
+PICK_GRASP_CUMULATIVE_DOWNWARD_ADJUSTMENT_M = (
+    BASELINE_PICK_GRASP_OFFSET_M - PICK_GRASP_OFFSET_M
+)
+PICK_LIFT_OFFSET_M = 0.031
+RAW_STEP_RAD = 2.0 * math.pi / 4096.0
+GRIPPER_OPEN_TARGET_RAW = 2048
+GRIPPER_OPEN_RAD = (2048 - GRIPPER_OPEN_TARGET_RAW) * RAW_STEP_RAD
+GRIPPER_CLOSE_TARGET_RAW = 1948
+GRIPPER_CLOSE_RAD = (2048 - GRIPPER_CLOSE_TARGET_RAW) * RAW_STEP_RAD
+POSITION_TOLERANCE_M = 0.001
+PLAN_RESIDUAL_BOUND_M = 0.0021
+GRASP_CROSSING_RESIDUAL_BOUND_RAD = math.radians(2.0)
+CAN_TOP_DOWN_TILT_BOUND_RAD = math.radians(20.0)
+CAN_DESIRED_APPROACH_WORKCELL = np.array([0.0, 0.0, -1.0])
+CAN_LENGTH_M = 0.12244
+CAN_DIAMETER_M = 0.053
+CAN_MASS_KG = 0.013
+CAN_GRASP_WIDTH_M = 0.044
+CAN_GRIPPER_OPEN_TARGET_RAW = 2500
+CAN_GRIPPER_CLOSE_TARGET_RAW = 2285
+CAN_GRIPPER_CLOSE_RAW_MIN = CAN_GRIPPER_CLOSE_TARGET_RAW
+CAN_GRIPPER_CLOSE_RAW_MAX = CAN_GRIPPER_CLOSE_TARGET_RAW
+CAN_CONTACT_RESIDUAL_RAW_MIN = 19
+CAN_CONTACT_RESIDUAL_RAW_MAX = 23
+CAN_MAXIMUM_UNMONITORED_CONTACT_HOLD_S = 5.0
+CAN_PICK_PREGRASP_OFFSET_M = 0.100
+CAN_PICK_GRASP_OFFSET_M = 0.0
+CAN_PICK_LIFT_OFFSET_M = 0.080
+DEFAULT_DUAL_URDF_PATH = (
+    ROOT / "ros2_ws/src/so101_description/urdf/so101_dual_preview.urdf.xacro"
+)
+DUAL_URDF_ENVIRONMENT = "SO101_DUAL_URDF_PATH"
+TOP_HOMOGRAPHY_PATH = (
+    ROOT
+    / "ros2_ws/src/manipulation_camera_manager/config/"
+    "top_worktable_homography.yaml"
+)
+LEFT_SCREEN_X_CORRECTION_M = 0.01372
+LEFT_SCREEN_X_CORRECTION_REASON = (
+    "operator_requested_left_target_13_72mm_screen_right"
+)
+RIGHT_SCREEN_X_CORRECTION_M = -0.02947
+RIGHT_SCREEN_X_CORRECTION_REASON = (
+    "operator_requested_right_target_29_47mm_screen_left"
+)
+
+
+def dual_urdf_path() -> Path:
+    path = Path(os.environ.get(DUAL_URDF_ENVIRONMENT, DEFAULT_DUAL_URDF_PATH))
+    if not path.is_file():
+        raise RuntimeError(f"dual robot description does not exist: {path}")
+    return path
+
+
+OPERATIONAL_LIMITS = ROOT / "config/bimanual_operational_limits.json"
+ARM_JOINT_SHORT_NAMES = (
+    "base",
+    "shoulder",
+    "elbow",
+    "wrist_flex",
+    "wrist_roll",
+)
+PLACE_PLAN_SHA256 = (
+    "39eae1f89d2ec9b0944227ec86eef61603450e45d67c0716013ba7df0730f9f5"
+)
+INTERARM_PLACE_WORKCELL_X_M = 0.420
+INTERARM_PLACE_WORKCELL_Y_M = -0.170
+INTERARM_PLACE_EXPECTED_CENTER_X_PX = 349.96007515
+INTERARM_PLACE_RIGHT_ROUTING_MIN_X_PX = 340.0
+
+
+@dataclass(frozen=True)
+class ObjectProfile:
+    name: str
+    target_topic: str
+    shadow_config: Path
+    pregrasp_offset_m: float
+    grasp_offset_m: float
+    lift_offset_m: float
+    enforce_grasp_yaw: bool
+    apply_lateral_adjustment: bool
+
+
+def object_profile(name: str) -> ObjectProfile:
+    if name == "pen":
+        return ObjectProfile(
+            name="pen",
+            target_topic=TARGET_TOPIC,
+            shadow_config=(
+                ROOT
+                / "ros2_ws/src/so101_top_perception/config/"
+                "top_shadow_target.yaml"
+            ),
+            pregrasp_offset_m=PICK_PREGRASP_OFFSET_M,
+            grasp_offset_m=PICK_GRASP_OFFSET_M,
+            lift_offset_m=PICK_LIFT_OFFSET_M,
+            enforce_grasp_yaw=False,
+            apply_lateral_adjustment=True,
+        )
+    if name == "can":
+        return ObjectProfile(
+            name="can",
+            target_topic=CAN_TARGET_TOPIC,
+            shadow_config=(
+                ROOT
+                / "ros2_ws/src/so101_top_perception/config/"
+                "top_can_shadow_target.yaml"
+            ),
+            pregrasp_offset_m=CAN_PICK_PREGRASP_OFFSET_M,
+            grasp_offset_m=CAN_PICK_GRASP_OFFSET_M,
+            lift_offset_m=CAN_PICK_LIFT_OFFSET_M,
+            enforce_grasp_yaw=True,
+            apply_lateral_adjustment=False,
+        )
+    raise ValueError(f"unsupported object profile: {name}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--object-profile",
+        choices=("pen", "can"),
+        default="pen",
+    )
+    parser.add_argument(
+        "--task",
+        choices=("pick-place", "pick-only"),
+        default="pick-place",
+    )
+    parser.add_argument(
+        "--target-topic",
+        help="override the object-profile pose topic",
+    )
+    parser.add_argument(
+        "--can-gripper-close-raw",
+        type=int,
+        help=(
+            "override the commissioned 44 mm can grasp target; the can profile "
+            f"defaults to and currently accepts only raw {CAN_GRIPPER_CLOSE_TARGET_RAW}"
+        ),
+    )
+    parser.add_argument(
+        "--interarm-place",
+        action="store_true",
+        help=(
+            "replace the proven default place XY with the reviewed left-to-right "
+            "staging point (0.420, -0.170) m; valid only when camera routing "
+            "selects the left arm"
+        ),
+    )
+    parser.add_argument("--target-samples", type=int, default=7)
+    parser.add_argument("--timeout-s", type=float, default=15.0)
+    parser.add_argument(
+        "--routing-deadband-px",
+        type=float,
+        default=DEFAULT_CAMERA_CENTER_DEADBAND_PX,
+    )
+    parser.add_argument(
+        "--shadow-config",
+        type=Path,
+    )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=ROOT / "config/single_arm_calibration.json",
+    )
+    parser.add_argument(
+        "--place-plan",
+        type=Path,
+        default=(
+            ROOT
+            / "artifacts/stage7/2026-08-10/place_pose_plan_only_offset014.json"
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+    )
+    args = parser.parse_args()
+    if not args.plan_only:
+        parser.error("--plan-only is required; this tool has no execution client")
+    if args.target_samples < 5:
+        parser.error("--target-samples must be at least 5")
+    if args.timeout_s <= 0.0:
+        parser.error("--timeout-s must be positive")
+    profile = object_profile(args.object_profile)
+    if args.object_profile == "can" and args.task != "pick-only":
+        parser.error("the can profile currently supports only --task pick-only")
+    if args.object_profile == "can" and args.can_gripper_close_raw is None:
+        args.can_gripper_close_raw = CAN_GRIPPER_CLOSE_TARGET_RAW
+    if (
+        args.can_gripper_close_raw is not None
+        and not CAN_GRIPPER_CLOSE_RAW_MIN
+        <= args.can_gripper_close_raw
+        <= CAN_GRIPPER_CLOSE_RAW_MAX
+    ):
+        parser.error(
+            "--can-gripper-close-raw must be inside the commissioned probe "
+            f"range {CAN_GRIPPER_CLOSE_RAW_MIN}..{CAN_GRIPPER_CLOSE_RAW_MAX}"
+        )
+    if args.object_profile == "pen" and args.can_gripper_close_raw is not None:
+        parser.error("--can-gripper-close-raw is valid only for the can profile")
+    if args.task == "pick-only" and args.interarm_place:
+        parser.error("--interarm-place cannot be used with --task pick-only")
+    args.profile = profile
+    args.target_topic = args.target_topic or profile.target_topic
+    args.shadow_config = args.shadow_config or profile.shadow_config
+    args.output = args.output or (
+        ROOT
+        / (
+            "artifacts/can_pick/dynamic_can_pick_plan.json"
+            if args.object_profile == "can"
+            else "artifacts/top_pick_place/2026-08-14/dynamic_plan_run01.json"
+        )
+    )
+    return args
+
+
+def target_sample(
+    node: Node, config, message: TopObjectPose, selected_arm: str
+) -> BaseTargetSample:
+    stamp_age = source_stamp_age_seconds(
+        node.get_clock().now().nanoseconds,
+        int(message.header.stamp.sec),
+        int(message.header.stamp.nanosec),
+        config.max_frame_age_s,
+        config.future_tolerance_s,
+    )
+    observation = BoardObservation(
+        source_frame=str(message.header.frame_id),
+        x_m=float(message.x_m),
+        y_m=float(message.y_m),
+        yaw_rad=float(message.yaw_rad),
+        frame_age_s=max(float(message.frame_age_s), stamp_age),
+        confidence=float(message.confidence),
+        footprint_inside=bool(message.footprint_inside),
+        image_fully_visible=bool(message.image_fully_visible),
+        motion_authorized=bool(message.motion_authorized),
+        robot_target_available=bool(message.robot_target_available),
+    )
+    result = evaluate_shadow(config, observation)
+    if not result.transform_validated:
+        raise RuntimeError(f"Top target transform is not validated: {result}")
+    x_m, y_m, z_m = (float(value) for value in result.position_m)
+    workspace_x_m, workspace_y_m = workspace_coordinates_for_arm(
+        x_m, y_m, selected_arm, z_m
+    )
+    bounds = config.workspace
+    radius_m = math.hypot(workspace_x_m, workspace_y_m)
+    inside_selected_workspace = (
+        bounds.x_min_m <= workspace_x_m <= bounds.x_max_m
+        and bounds.y_min_m <= workspace_y_m <= bounds.y_max_m
+        and bounds.z_min_m <= z_m <= bounds.z_max_m
+        and bounds.radial_min_m <= radius_m <= bounds.radial_max_m
+    )
+    if not inside_selected_workspace:
+        raise RuntimeError(
+            f"Top target is outside {selected_arm} conservative workspace: "
+            f"workcell=({x_m:.6f},{y_m:.6f},{z_m:.6f}) "
+            f"arm_xy=({workspace_x_m:.6f},{workspace_y_m:.6f}) "
+            f"radius={radius_m:.6f}"
+        )
+    return BaseTargetSample(
+        float(result.position_m[0]),
+        float(result.position_m[1]),
+        float(result.position_m[2]),
+        float(result.yaw_rad),
+        observation.confidence,
+    )
+
+
+def wait_target(node, messages, config, count, timeout_s, deadband_px):
+    deadline = time.monotonic() + timeout_s
+    samples = []
+    sides = []
+    center_x_samples = []
+    center_y_samples = []
+    image_widths = []
+    image_heights = []
+    stamps = set()
+    rejection = "no observation"
+    while len(samples) < count and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if not messages:
+            continue
+        message = messages[-1]
+        stamp = (int(message.header.stamp.sec), int(message.header.stamp.nanosec))
+        if stamp in stamps:
+            continue
+        stamps.add(stamp)
+        try:
+            side = select_arm_for_pixel(
+                float(message.center_x_px),
+                int(message.image_width_px),
+                deadband_px,
+            )
+            samples.append(target_sample(node, config, message, side))
+            sides.append(side)
+            center_x_samples.append(float(message.center_x_px))
+            center_y_samples.append(float(message.center_y_px))
+            image_widths.append(int(message.image_width_px))
+            image_heights.append(int(message.image_height_px))
+            print(
+                "DYNAMIC_PICK_TARGET_SAMPLE "
+                f"count={len(samples)}/{count} side={side} "
+                f"pixel_x={float(message.center_x_px):.1f}/"
+                f"{int(message.image_width_px)}"
+            )
+        except (ShadowTargetError, RuntimeError, ValueError) as error:
+            rejection = f"{type(error).__name__}: {error}"
+    if len(samples) < count:
+        raise RuntimeError(f"only {len(samples)}/{count} valid samples; {rejection}")
+    if len(set(image_widths)) != 1:
+        raise RuntimeError(f"camera image width changed during lock: {image_widths}")
+    if len(set(image_heights)) != 1:
+        raise RuntimeError(
+            f"camera image height changed during lock: {image_heights}"
+        )
+    selected_arm = require_consistent_arm_selection(sides)
+    return (
+        lock_target(samples),
+        selected_arm,
+        float(median(center_x_samples)),
+        float(median(center_y_samples)),
+        image_widths[0],
+        image_heights[0],
+    )
+
+
+def screen_positive_x_unit_workcell(
+    homography_path: Path,
+    center_x_px: float,
+    center_y_px: float,
+) -> tuple[float, float]:
+    document = yaml.safe_load(homography_path.read_text(encoding="utf-8"))
+    pixel_to_board = np.asarray(
+        document["homography"]["rectified_pixel_to_board_m"]["data"],
+        dtype=float,
+    )
+    base_from_board = np.asarray(
+        document["base_registration"]["base_from_board"]["data"],
+        dtype=float,
+    )
+    if pixel_to_board.shape != (3, 3) or base_from_board.shape != (4, 4):
+        raise RuntimeError("top homography matrix dimensions are invalid")
+
+    def project(pixel_x: float) -> np.ndarray:
+        homogeneous = pixel_to_board @ np.asarray(
+            (pixel_x, center_y_px, 1.0), dtype=float
+        )
+        if abs(float(homogeneous[2])) < 1.0e-12:
+            raise RuntimeError("top homography screen-x direction is singular")
+        return homogeneous[:2] / homogeneous[2]
+
+    board_delta = project(center_x_px + 1.0) - project(center_x_px)
+    workcell_delta = base_from_board[:2, :2] @ board_delta
+    length = float(np.linalg.norm(workcell_delta))
+    if not math.isfinite(length) or length < 1.0e-12:
+        raise RuntimeError("top homography screen-x direction is invalid")
+    unit = workcell_delta / length
+    return float(unit[0]), float(unit[1])
+
+
+def arm_contract(side: str) -> tuple[str, tuple[str, ...], str]:
+    joints = ARM_JOINTS_BY_SIDE[side]
+    return f"{side}_arm", joints, f"{side}_gripper_frame_link"
+
+
+def full_q0_state() -> JointState:
+    state = JointState()
+    state.name = list(CANONICAL_JOINTS)
+    state.position = [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        GRIPPER_OPEN_RAD,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        GRIPPER_OPEN_RAD,
+    ]
+    return state
+
+
+def wait_future(node, future, timeout_s: float):
+    deadline = time.monotonic() + timeout_s
+    while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if not future.done():
+        raise TimeoutError("MoveIt service response timeout")
+    result = future.result()
+    if result is None:
+        raise RuntimeError("MoveIt service returned no response")
+    return result
+
+
+def pose_goal(side: str, x: float, y: float, z: float) -> Constraints:
+    _, _, tcp_link = arm_contract(side)
+    constraints = Constraints()
+    constraints.name = f"{side}_top_down_position"
+    position = PositionConstraint()
+    position.header.frame_id = WORKCELL_FRAME
+    position.link_name = tcp_link
+    region = SolidPrimitive()
+    region.type = SolidPrimitive.BOX
+    region.dimensions = [2.0 * POSITION_TOLERANCE_M] * 3
+    pose = Pose()
+    pose.position.x = x
+    pose.position.y = y
+    pose.position.z = z
+    pose.orientation.w = 1.0
+    position.constraint_region.primitives = [region]
+    position.constraint_region.primitive_poses = [pose]
+    position.weight = 1.0
+    constraints.position_constraints = [position]
+    return constraints
+
+
+def pose_request(side: str, x: float, y: float, z: float):
+    group_name, _, _ = arm_contract(side)
+    request = GetMotionPlan.Request()
+    motion = request.motion_plan_request
+    motion.workspace_parameters.header.frame_id = WORKCELL_FRAME
+    motion.workspace_parameters.min_corner.x = -0.60
+    motion.workspace_parameters.min_corner.y = -0.60
+    motion.workspace_parameters.min_corner.z = -0.10
+    motion.workspace_parameters.max_corner.x = 0.60
+    motion.workspace_parameters.max_corner.y = 0.60
+    motion.workspace_parameters.max_corner.z = 0.60
+    motion.start_state = RobotState()
+    motion.start_state.joint_state = full_q0_state()
+    motion.start_state.is_diff = False
+    motion.goal_constraints = [pose_goal(side, x, y, z)]
+    motion.pipeline_id = "ompl"
+    motion.planner_id = "RRTConnectkConfigDefault"
+    motion.group_name = group_name
+    motion.num_planning_attempts = 5
+    motion.allowed_planning_time = 5.0
+    motion.max_velocity_scaling_factor = 0.20
+    motion.max_acceleration_scaling_factor = 0.20
+    return request
+
+
+def measure_tcp(fk_client, node, side, joint_names, positions):
+    _, _, tcp_link = arm_contract(side)
+    request = GetPositionFK.Request()
+    request.header.frame_id = WORKCELL_FRAME
+    request.fk_link_names = [tcp_link]
+    state = JointState()
+    state.name = list(joint_names)
+    state.position = [float(value) for value in positions]
+    request.robot_state = RobotState()
+    request.robot_state.joint_state = state
+    response = wait_future(node, fk_client.call_async(request), 8.0)
+    if int(response.error_code.val) != MoveItErrorCodes.SUCCESS:
+        raise RuntimeError(f"{FK_SERVICE} rejected {side} solution")
+    point = response.pose_stamped[0].pose.position
+    return [float(point.x), float(point.y), float(point.z)]
+
+
+def load_yaw_kinematics(side: str) -> GraspYawKinematics:
+    import xacro
+
+    xml = xacro.process_file(str(dual_urdf_path())).toxml()
+    with tempfile.NamedTemporaryFile("w", suffix=".urdf") as urdf:
+        urdf.write(xml)
+        urdf.flush()
+        return GraspYawKinematics(Path(urdf.name), prefix=f"{side}_")
+
+
+def load_arm_joint_bounds(side: str) -> tuple[np.ndarray, np.ndarray]:
+    document = json.loads(OPERATIONAL_LIMITS.read_text(encoding="utf-8"))
+    if (
+        document.get("status") != "OPERATOR_VERIFIED_FULL_TASK_ENVELOPE"
+        or document.get("operator_approved") is not True
+        or document.get("firmware_limit_authorized") is not True
+    ):
+        raise RuntimeError("bimanual operational limits are not approved")
+    arm = document["arms"][side]
+    lower = np.array(
+        [arm[name]["minimum_urad"] / 1.0e6 for name in ARM_JOINT_SHORT_NAMES]
+    )
+    upper = np.array(
+        [arm[name]["maximum_urad"] / 1.0e6 for name in ARM_JOINT_SHORT_NAMES]
+    )
+    return lower, upper
+
+
+def solve_endpoint_pose_with_locked_wrist(
+    kinematics,
+    side,
+    joint_names,
+    position_only_solution,
+    reference,
+    target_workcell,
+    pen_yaw_rad,
+    lower,
+    upper,
+):
+    """Solve TCP xyz with wrist roll locked at the bimanual q0 angle."""
+    original = np.asarray(position_only_solution, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    target = kinematics.point_in_base_frame(
+        np.asarray(target_workcell, dtype=float),
+        root_link=WORKCELL_FRAME,
+    )
+    locked_wrist_roll = 0.0
+    if not lower[4] <= locked_wrist_roll <= upper[4]:
+        raise RuntimeError(
+            f"{side} q0 wrist roll is outside operational limits"
+        )
+
+    seeds = (
+        original[:4],
+        reference[:4],
+        np.concatenate((original[:2], reference[2:4])),
+        np.concatenate((reference[:2], original[2:4])),
+    )
+    candidates = []
+    candidate_keys = set()
+
+    def complete(values):
+        return np.concatenate((values, [locked_wrist_roll]))
+
+    def residuals(values):
+        positions = dict(zip(joint_names, complete(values), strict=True))
+        return 1000.0 * (
+            kinematics.tcp_position(positions) - target
+        )
+
+    for seed in seeds:
+        clipped = np.clip(seed, lower[:4] + 1.0e-8, upper[:4] - 1.0e-8)
+        result = least_squares(
+            residuals,
+            clipped,
+            bounds=(lower[:4], upper[:4]),
+            xtol=1.0e-11,
+            ftol=1.0e-11,
+            gtol=1.0e-11,
+            max_nfev=1200,
+        )
+        solved = complete(result.x)
+        positions = dict(zip(joint_names, solved, strict=True))
+        achieved = kinematics.tcp_position(positions)
+        position_error_m = float(np.linalg.norm(achieved - target))
+        if position_error_m > PLAN_RESIDUAL_BOUND_M:
+            continue
+        key = tuple(round(float(value), 8) for value in solved)
+        if key in candidate_keys:
+            continue
+        candidate_keys.add(key)
+        transition = np.abs(solved - reference)
+        achieved_finger_yaw = float(kinematics.finger_yaw(positions))
+        finger_target_yaw = wrap_half_turn(pen_yaw_rad + math.pi / 2.0)
+        crossing_error_rad = abs(
+            wrap_half_turn(achieved_finger_yaw - finger_target_yaw)
+        )
+        candidates.append(
+            (
+                float(np.max(transition[:4])),
+                float(np.linalg.norm(transition[:4])),
+                position_error_m,
+                solved,
+                achieved_finger_yaw,
+                finger_target_yaw,
+                crossing_error_rad,
+                int(result.nfev),
+            )
+        )
+
+    if not candidates:
+        raise RuntimeError(
+            f"no {side} endpoint solution preserves the q0 wrist angle "
+            "while meeting the TCP position bound"
+        )
+    candidates.sort(key=lambda item: item[:3])
+    selected = candidates[0]
+    return {
+        "positions_rad": tuple(float(value) for value in selected[3]),
+        "position_residual_m": selected[2],
+        "finger_target_yaw_rad": selected[5],
+        "achieved_finger_yaw_rad": selected[4],
+        "crossing_residual_rad": selected[6],
+        "reference_maximum_joint_delta_rad": selected[0],
+        "candidate_count": len(candidates),
+        "solver_evaluations": selected[7],
+        "wrist_roll_reference_rad": locked_wrist_roll,
+        "wrist_roll_delta_rad": 0.0,
+    }
+
+
+def solve_endpoint_pose_with_grasp_yaw(
+    kinematics,
+    side,
+    joint_names,
+    position_only_solution,
+    reference,
+    target_workcell,
+    object_yaw_rad,
+    lower,
+    upper,
+):
+    """Solve a vertical top-down TCP pose whose jaws cross the can body."""
+    original = np.asarray(position_only_solution, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    target = kinematics.point_in_base_frame(
+        np.asarray(target_workcell, dtype=float),
+        root_link=WORKCELL_FRAME,
+    )
+    desired_approach = kinematics.vector_in_base_frame(
+        CAN_DESIRED_APPROACH_WORKCELL,
+        root_link=WORKCELL_FRAME,
+    )
+    finger_target_yaw = wrap_half_turn(object_yaw_rad + math.pi / 2.0)
+
+    seeds = [
+        original,
+        reference,
+        np.concatenate((original[:2], reference[2:])),
+        np.concatenate((reference[:2], original[2:])),
+    ]
+    for seed in tuple(seeds):
+        positions = dict(zip(joint_names, seed, strict=True))
+        yaw_solution = kinematics.solve_wrist_roll(
+            positions,
+            finger_target_yaw,
+            float(lower[4]),
+            float(upper[4]),
+        )
+        if yaw_solution["within_limits"]:
+            corrected = np.array(seed, copy=True)
+            corrected[4] = float(yaw_solution["solved_wrist_roll_rad"])
+            seeds.append(corrected)
+
+    # Position-only IK commonly returns the side-entry branch. Add a small,
+    # deterministic posture sweep so the nonlinear solve can discover the
+    # physically distinct top-down branch without relying on randomness.
+    midpoint = (lower + upper) / 2.0
+    for shoulder_fraction, elbow_fraction in (
+        (0.25, 0.25),
+        (0.25, 0.75),
+        (0.50, 0.25),
+        (0.50, 0.50),
+        (0.50, 0.75),
+        (0.75, 0.25),
+        (0.75, 0.50),
+        (0.75, 0.75),
+    ):
+        for flex_fraction in (0.02, 0.15, 0.50):
+            swept = np.array(midpoint, copy=True)
+            swept[0] = original[0]
+            swept[1] = lower[1] + shoulder_fraction * (upper[1] - lower[1])
+            swept[2] = lower[2] + elbow_fraction * (upper[2] - lower[2])
+            swept[3] = lower[3] + flex_fraction * (upper[3] - lower[3])
+            swept[4] = original[4]
+            seeds.append(swept)
+
+    def residuals(values):
+        positions = dict(zip(joint_names, values, strict=True))
+        position_residual_mm = 1000.0 * (
+            kinematics.tcp_position(positions) - target
+        )
+        yaw_residual = 100.0 * wrap_half_turn(
+            kinematics.finger_yaw(positions) - finger_target_yaw
+        )
+        # Position and jaw crossing are hard task constraints. The approach
+        # tilt is evaluated separately below so the solver never trades
+        # centimetres of TCP error for a cosmetically more vertical pose.
+        return np.concatenate((position_residual_mm, [yaw_residual]))
+
+    candidates = []
+    candidate_keys = set()
+    for seed in seeds:
+        clipped = np.clip(seed, lower + 1.0e-8, upper - 1.0e-8)
+        result = least_squares(
+            residuals,
+            clipped,
+            bounds=(lower, upper),
+            xtol=1.0e-11,
+            ftol=1.0e-11,
+            gtol=1.0e-11,
+            max_nfev=1600,
+        )
+        solved = np.asarray(result.x, dtype=float)
+        positions = dict(zip(joint_names, solved, strict=True))
+        achieved = kinematics.tcp_position(positions)
+        position_error_m = float(np.linalg.norm(achieved - target))
+        achieved_finger_yaw = float(kinematics.finger_yaw(positions))
+        crossing_error_rad = abs(
+            wrap_half_turn(achieved_finger_yaw - finger_target_yaw)
+        )
+        achieved_approach = kinematics.approach_axis(positions)
+        approach_tilt_rad = math.acos(
+            float(np.clip(np.dot(achieved_approach, desired_approach), -1.0, 1.0))
+        )
+        if (
+            position_error_m > PLAN_RESIDUAL_BOUND_M
+            or crossing_error_rad > GRASP_CROSSING_RESIDUAL_BOUND_RAD
+            or approach_tilt_rad > CAN_TOP_DOWN_TILT_BOUND_RAD
+        ):
+            continue
+        key = tuple(round(float(value), 8) for value in solved)
+        if key in candidate_keys:
+            continue
+        candidate_keys.add(key)
+        transition = np.abs(solved - reference)
+        candidates.append(
+            (
+                float(np.max(transition)),
+                float(np.linalg.norm(transition)),
+                position_error_m,
+                crossing_error_rad,
+                approach_tilt_rad,
+                solved,
+                achieved_finger_yaw,
+                achieved_approach,
+                int(result.nfev),
+            )
+        )
+
+    if not candidates:
+        raise RuntimeError(
+            f"no {side} endpoint solution meets both TCP position and "
+            "can crossing-yaw and top-down approach bounds"
+        )
+    candidates.sort(key=lambda item: (item[4], item[2], item[3], item[0], item[1]))
+    selected = candidates[0]
+    return {
+        "positions_rad": tuple(float(value) for value in selected[5]),
+        "position_residual_m": selected[2],
+        "finger_target_yaw_rad": finger_target_yaw,
+        "achieved_finger_yaw_rad": selected[6],
+        "crossing_residual_rad": selected[3],
+        "desired_approach_axis": tuple(float(value) for value in desired_approach),
+        "achieved_approach_axis": tuple(float(value) for value in selected[7]),
+        "approach_tilt_rad": selected[4],
+        "reference_maximum_joint_delta_rad": selected[0],
+        "candidate_count": len(candidates),
+        "solver_evaluations": selected[8],
+        "wrist_roll_reference_rad": float(reference[4]),
+        "wrist_roll_delta_rad": float(selected[5][4] - reference[4]),
+    }
+
+
+def plan_endpoint(
+    node,
+    plan_client,
+    fk_client,
+    kinematics,
+    bounds,
+    reference,
+    side,
+    name,
+    x,
+    y,
+    z,
+    yaw,
+    enforce_grasp_yaw=False,
+):
+    response = wait_future(
+        node,
+        plan_client.call_async(pose_request(side, x, y, z)),
+        8.0,
+    ).motion_plan_response
+    trajectory = response.trajectory.joint_trajectory
+    _, joints, _ = arm_contract(side)
+    if (
+        int(response.error_code.val) != MoveItErrorCodes.SUCCESS
+        or not trajectory.points
+    ):
+        raise RuntimeError(
+            f"MoveIt endpoint failed: side={side} name={name} "
+            f"code={response.error_code.val}"
+        )
+    if tuple(trajectory.joint_names) != joints:
+        raise RuntimeError(f"MoveIt endpoint joint order mismatch: {name}")
+    position_only_final = tuple(
+        float(value) for value in trajectory.points[-1].positions
+    )
+    solver = (
+        solve_endpoint_pose_with_grasp_yaw
+        if enforce_grasp_yaw
+        else solve_endpoint_pose_with_locked_wrist
+    )
+    crossing = solver(
+        kinematics,
+        side,
+        trajectory.joint_names,
+        position_only_final,
+        reference,
+        (x, y, z),
+        yaw,
+        *bounds,
+    )
+    final = crossing["positions_rad"]
+    achieved = measure_tcp(
+        fk_client, node, side, trajectory.joint_names, final
+    )
+    residual = math.dist(achieved, (x, y, z))
+    if residual > PLAN_RESIDUAL_BOUND_M:
+        raise RuntimeError(
+            f"MoveIt endpoint residual failed: {name} residual={residual:.6f}m"
+        )
+    orientation_contract = {
+        "orientation_constraint_applied": False,
+        "top_down_constraint_applied": False,
+        "wrist_roll_yaw_correction_applied": False,
+        "wrist_roll_policy": "hold_bimanual_q0",
+        "wrist_roll_locked": True,
+        "relationship": "informational_only_wrist_locked_at_q0",
+    }
+    if enforce_grasp_yaw:
+        orientation_contract.update({
+            "orientation_constraint_applied": True,
+            "top_down_constraint_applied": True,
+            "wrist_roll_yaw_correction_applied": True,
+            "wrist_roll_policy": "solve_can_crossing_yaw",
+            "wrist_roll_locked": False,
+            "relationship": (
+                "enforced_overhead_downward_jaws_perpendicular_to_can_long_axis"
+            ),
+        })
+    return {
+        "name": name,
+        "target_m": [x, y, z],
+        "yaw_rad": yaw,
+        "orientation_constraint_applied": orientation_contract[
+            "orientation_constraint_applied"
+        ],
+        "top_down_constraint_applied": orientation_contract[
+            "top_down_constraint_applied"
+        ],
+        "wrist_roll_yaw_correction_applied": orientation_contract[
+            "wrist_roll_yaw_correction_applied"
+        ],
+        "wrist_roll_policy": orientation_contract["wrist_roll_policy"],
+        "wrist_roll_locked": orientation_contract["wrist_roll_locked"],
+        "wrist_roll_reference_rad": crossing[
+            "wrist_roll_reference_rad"
+        ],
+        "wrist_roll_delta_rad": crossing["wrist_roll_delta_rad"],
+        "grasp_geometry": {
+            "relationship": orientation_contract["relationship"],
+            "target_crossing_angle_rad": math.pi / 2.0,
+            "finger_target_yaw_rad": crossing["finger_target_yaw_rad"],
+            "achieved_finger_yaw_rad": crossing["achieved_finger_yaw_rad"],
+            "crossing_residual_rad": crossing["crossing_residual_rad"],
+            "crossing_residual_bound_rad": GRASP_CROSSING_RESIDUAL_BOUND_RAD,
+            "desired_approach_axis": (
+                list(crossing["desired_approach_axis"])
+                if enforce_grasp_yaw
+                else None
+            ),
+            "achieved_approach_axis": (
+                list(crossing["achieved_approach_axis"])
+                if enforce_grasp_yaw
+                else None
+            ),
+            "approach_tilt_rad": (
+                crossing["approach_tilt_rad"] if enforce_grasp_yaw else None
+            ),
+            "approach_tilt_bound_rad": (
+                CAN_TOP_DOWN_TILT_BOUND_RAD if enforce_grasp_yaw else None
+            ),
+        },
+        "position_only_final_joint_positions_rad": list(position_only_final),
+        "final_joint_positions_rad": list(final),
+        "achieved_tcp_m": achieved,
+        "plan_residual_norm_m": residual,
+        "moveit_error_code": int(response.error_code.val),
+        "yaw_constrained_candidate_count": crossing["candidate_count"],
+        "yaw_solver_evaluations": crossing["solver_evaluations"],
+        "reference_maximum_joint_delta_rad": crossing[
+            "reference_maximum_joint_delta_rad"
+        ],
+    }
+
+
+def load_place_targets(path: Path):
+    if sha256_file(path) != PLACE_PLAN_SHA256:
+        raise RuntimeError("place plan sha256 mismatch")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("status") != "PLAN_ONLY_PASS":
+        raise RuntimeError("place plan is not PLAN_ONLY_PASS")
+    by_name = {item["name"]: item for item in document["plans"]}
+    result = {}
+    for name in ("pregrasp", "grasp"):
+        item = by_name[name]
+        result[name] = (
+            *(float(value) for value in item["target_m"]),
+            float(item["yaw_rad"]),
+        )
+    return result
+
+
+def select_place_targets(path: Path, *, interarm_place: bool, side: str):
+    targets = load_place_targets(path)
+    source = {
+        "path": str(path),
+        "sha256": PLACE_PLAN_SHA256,
+        "coordinate_reused": "workcell_base_link",
+        "joint_solution_reused": False,
+        "mode": "proven_default_place",
+        "right_arm_physical_place_validation_required": side == "right",
+    }
+    if not interarm_place:
+        return targets, source
+    if side != "left":
+        raise RuntimeError(
+            "--interarm-place is only valid for the left-arm first stage"
+        )
+    targets = {
+        name: (
+            INTERARM_PLACE_WORKCELL_X_M,
+            INTERARM_PLACE_WORKCELL_Y_M,
+            values[2],
+            values[3],
+        )
+        for name, values in targets.items()
+    }
+    source.update({
+        "mode": "left_to_right_interarm_stage",
+        "default_place_xy_replaced": True,
+        "interarm_place_workcell_xy_m": [
+            INTERARM_PLACE_WORKCELL_X_M,
+            INTERARM_PLACE_WORKCELL_Y_M,
+        ],
+        "expected_next_selected_arm": "right",
+        "expected_center_x_px_from_full_table_calibration": (
+            INTERARM_PLACE_EXPECTED_CENTER_X_PX
+        ),
+        "right_routing_minimum_x_px": INTERARM_PLACE_RIGHT_ROUTING_MIN_X_PX,
+        "right_routing_margin_px": (
+            INTERARM_PLACE_EXPECTED_CENTER_X_PX
+            - INTERARM_PLACE_RIGHT_ROUTING_MIN_X_PX
+        ),
+    })
+    return targets, source
+
+
+def interpolate_segments(start, target):
+    largest = max(abs(b - a) for a, b in zip(start, target, strict=True))
+    count = max(1, math.ceil(largest / MAX_JOINT_STEP_RAD))
+    points = [tuple(start)]
+    for index in range(1, count):
+        points.append(
+            tuple(
+                a + (b - a) * index / count
+                for a, b in zip(start, target, strict=True)
+            )
+        )
+    points.append(tuple(target))
+    return list(zip(points[:-1], points[1:], strict=True))
+
+
+def joint_request(side, start, target):
+    group_name, joints, _ = arm_contract(side)
+    request = GetMotionPlan.Request()
+    motion = request.motion_plan_request
+    motion.workspace_parameters.header.frame_id = WORKCELL_FRAME
+    motion.workspace_parameters.min_corner.x = -0.60
+    motion.workspace_parameters.min_corner.y = -0.60
+    motion.workspace_parameters.min_corner.z = -0.10
+    motion.workspace_parameters.max_corner.x = 0.60
+    motion.workspace_parameters.max_corner.y = 0.60
+    motion.workspace_parameters.max_corner.z = 0.60
+    state = full_q0_state()
+    selected_offset = 0 if side == "left" else 6
+    for index, value in enumerate(start):
+        state.position[selected_offset + index] = float(value)
+    motion.start_state.joint_state = state
+    motion.start_state.is_diff = False
+    goal = Constraints()
+    goal.name = f"{side}_bounded_segment"
+    for name, value in zip(joints, target, strict=True):
+        joint = JointConstraint()
+        joint.joint_name = name
+        joint.position = float(value)
+        joint.tolerance_above = JOINT_GOAL_TOLERANCE_RAD
+        joint.tolerance_below = JOINT_GOAL_TOLERANCE_RAD
+        joint.weight = 1.0
+        goal.joint_constraints.append(joint)
+    motion.goal_constraints = [goal]
+    motion.pipeline_id = "ompl"
+    motion.planner_id = "RRTConnectkConfigDefault"
+    motion.group_name = group_name
+    motion.num_planning_attempts = 5
+    motion.allowed_planning_time = 5.0
+    motion.max_velocity_scaling_factor = 0.15
+    motion.max_acceleration_scaling_factor = 0.15
+    return request
+
+
+def plan_phase(node, client, side, name, start, target):
+    _, joints, _ = arm_contract(side)
+    results = []
+    for index, (segment_start, segment_target) in enumerate(
+        interpolate_segments(start, target), start=1
+    ):
+        response = wait_future(
+            node,
+            client.call_async(joint_request(side, segment_start, segment_target)),
+            8.0,
+        ).motion_plan_response
+        trajectory = response.trajectory.joint_trajectory
+        success = (
+            int(response.error_code.val) == MoveItErrorCodes.SUCCESS
+            and bool(trajectory.points)
+            and tuple(trajectory.joint_names) == joints
+        )
+        result = {
+            "index": index,
+            "expected_start_positions_rad": list(segment_start),
+            "target_positions_rad": list(segment_target),
+            "maximum_joint_delta_rad": max(
+                abs(b - a)
+                for a, b in zip(segment_start, segment_target, strict=True)
+            ),
+            "moveit_error_code": int(response.error_code.val),
+            "trajectory_joint_names": list(trajectory.joint_names),
+            "trajectory_positions_rad": [
+                list(point.positions) for point in trajectory.points
+            ],
+            "success": success,
+        }
+        if success:
+            residual = max(
+                abs(float(actual) - float(expected))
+                for actual, expected in zip(
+                    trajectory.points[-1].positions,
+                    segment_target,
+                    strict=True,
+                )
+            )
+            result["joint_goal_residual_rad"] = residual
+            result["success"] = residual <= 0.00075
+        results.append(result)
+    if not all(item["success"] for item in results):
+        raise RuntimeError(f"MoveIt phase collision plan failed: {name}")
+    print(f"DYNAMIC_PICK_PHASE_PLAN_PASS phase={name} segments={len(results)}")
+    return {"name": name, "segments": results}
+
+
+def steps_from_phases(
+    phases,
+    *,
+    gripper_open_rad=GRIPPER_OPEN_RAD,
+    gripper_close_rad=GRIPPER_CLOSE_RAD,
+):
+    steps = [
+        {
+            "kind": "gripper",
+            "phase": "pick_open",
+            "target_position_rad": gripper_open_rad,
+        }
+    ]
+    for phase in phases:
+        if phase["name"] == "pick_grasp_to_lift":
+            steps.append(
+                {
+                    "kind": "gripper",
+                    "phase": "pick_close",
+                    "target_position_rad": gripper_close_rad,
+                }
+            )
+        if phase["name"] == "place_grasp_to_retreat":
+            steps.append(
+                {
+                    "kind": "gripper",
+                    "phase": "place_release",
+                    "target_position_rad": gripper_open_rad,
+                }
+            )
+        for segment in phase["segments"]:
+            steps.append(
+                {
+                    "kind": "arm",
+                    "phase": phase["name"],
+                    "target_positions_rad": segment["target_positions_rad"],
+                    "maximum_joint_delta_rad": segment[
+                        "maximum_joint_delta_rad"
+                    ],
+                }
+            )
+    for index, step in enumerate(steps, start=1):
+        step["index"] = index
+    return steps
+
+
+def main() -> int:
+    args = parse_args()
+    profile = args.profile
+    config = load_shadow_config(args.shadow_config)
+    if config.output_frame != "left_base_link":
+        raise RuntimeError(
+            "Top shadow transform must currently terminate at left_base_link"
+        )
+    rclpy.init()
+    node = Node("top_camera_dynamic_pick_place_planner")
+    messages = []
+    node.create_subscription(
+        TopObjectPose, args.target_topic, messages.append, 10
+    )
+    plan_client = node.create_client(GetMotionPlan, PLAN_SERVICE)
+    fk_client = node.create_client(GetPositionFK, FK_SERVICE)
+    try:
+        if not plan_client.wait_for_service(timeout_sec=args.timeout_s):
+            raise RuntimeError(f"service unavailable: {PLAN_SERVICE}")
+        if not fk_client.wait_for_service(timeout_sec=args.timeout_s):
+            raise RuntimeError(f"service unavailable: {FK_SERVICE}")
+        (
+            locked,
+            side,
+            center_x_px,
+            center_y_px,
+            image_width_px,
+            image_height_px,
+        ) = wait_target(
+            node,
+            messages,
+            config,
+            args.target_samples,
+            args.timeout_s,
+            args.routing_deadband_px,
+        )
+        observed_x, observed_y, z, yaw = (
+            locked.x_m,
+            locked.y_m,
+            locked.z_m,
+            locked.yaw_rad,
+        )
+        x, y = observed_x, observed_y
+        if profile.apply_lateral_adjustment:
+            correction_m = (
+                LEFT_SCREEN_X_CORRECTION_M
+                if side == "left"
+                else RIGHT_SCREEN_X_CORRECTION_M
+            )
+            correction_reason = (
+                LEFT_SCREEN_X_CORRECTION_REASON
+                if side == "left"
+                else RIGHT_SCREEN_X_CORRECTION_REASON
+            )
+            unit_x, unit_y = screen_positive_x_unit_workcell(
+                TOP_HOMOGRAPHY_PATH,
+                center_x_px,
+                center_y_px,
+            )
+        else:
+            correction_m = 0.0
+            correction_reason = "can_profile_has_no_measured_lateral_bias"
+            unit_x, unit_y = 0.0, 0.0
+        delta_x = unit_x * correction_m
+        delta_y = unit_y * correction_m
+        x += delta_x
+        y += delta_y
+        lateral_adjustment = {
+            "applied": profile.apply_lateral_adjustment,
+            "selected_arm": side,
+            "screen_axis": "positive_image_x",
+            "operator_requested_screen_x_correction_m": correction_m,
+            "command_correction_m": correction_m,
+            "direction_unit_workcell_xy": [unit_x, unit_y],
+            "delta_workcell_xy_m": [delta_x, delta_y],
+            "observed_target_xy_m": [observed_x, observed_y],
+            "corrected_target_xy_m": [x, y],
+            "reason": correction_reason,
+            "homography": {
+                "path": str(TOP_HOMOGRAPHY_PATH),
+                "sha256": sha256_file(TOP_HOMOGRAPHY_PATH),
+            },
+        }
+        screen_direction = "right" if correction_m > 0.0 else "left"
+        print(
+            f"DYNAMIC_PICK_{side.upper()}_LATERAL_CORRECTION_PASS "
+            f"screen_{screen_direction}_mm={abs(correction_m) * 1000.0:.3f} "
+            f"delta_workcell_mm=({delta_x * 1000.0:.3f},"
+            f"{delta_y * 1000.0:.3f}) "
+            f"corrected_target=({x:.6f},{y:.6f})"
+        )
+        target_specs = {
+            "pick_pregrasp": (x, y, z + profile.pregrasp_offset_m, yaw),
+            "pick_grasp": (x, y, z + profile.grasp_offset_m, yaw),
+            "pick_lift": (x, y, z + profile.lift_offset_m, yaw),
+        }
+        place = None
+        place_source = None
+        if args.task == "pick-place":
+            place, place_source = select_place_targets(
+                args.place_plan,
+                interarm_place=args.interarm_place,
+                side=side,
+            )
+            target_specs.update({
+                "place_pregrasp": place["pregrasp"],
+                "place_grasp": place["grasp"],
+            })
+        kinematics = load_yaw_kinematics(side)
+        bounds = load_arm_joint_bounds(side)
+        endpoints = {}
+        reference = Q0
+        for name, values in target_specs.items():
+            endpoints[name] = plan_endpoint(
+                node,
+                plan_client,
+                fk_client,
+                kinematics,
+                bounds,
+                reference,
+                side,
+                name,
+                *values,
+                enforce_grasp_yaw=profile.enforce_grasp_yaw,
+            )
+            reference = tuple(
+                endpoints[name]["final_joint_positions_rad"]
+            )
+        positions = {
+            name: tuple(item["final_joint_positions_rad"])
+            for name, item in endpoints.items()
+        }
+        pick_phase_specs = (
+            ("q0_to_pick_pregrasp", Q0, positions["pick_pregrasp"]),
+            (
+                "pick_pregrasp_to_grasp",
+                positions["pick_pregrasp"],
+                positions["pick_grasp"],
+            ),
+            (
+                "pick_grasp_to_lift",
+                positions["pick_grasp"],
+                positions["pick_lift"],
+            ),
+        )
+        if args.task == "pick-only":
+            phase_specs = pick_phase_specs
+        else:
+            phase_specs = pick_phase_specs + (
+                (
+                "lift_to_place_pregrasp",
+                positions["pick_lift"],
+                positions["place_pregrasp"],
+                ),
+                (
+                "place_pregrasp_to_grasp",
+                positions["place_pregrasp"],
+                positions["place_grasp"],
+                ),
+                (
+                "place_grasp_to_retreat",
+                positions["place_grasp"],
+                positions["place_pregrasp"],
+                ),
+                ("place_pregrasp_to_q0", positions["place_pregrasp"], Q0),
+            )
+        phases = [
+            plan_phase(node, plan_client, side, name, start, target)
+            for name, start, target in phase_specs
+        ]
+        gripper_close_target_raw = (
+            args.can_gripper_close_raw
+            if profile.name == "can"
+            else GRIPPER_CLOSE_TARGET_RAW
+        )
+        gripper_open_target_raw = (
+            CAN_GRIPPER_OPEN_TARGET_RAW
+            if profile.name == "can"
+            else GRIPPER_OPEN_TARGET_RAW
+        )
+        gripper_open_rad = (
+            2048 - gripper_open_target_raw
+        ) * RAW_STEP_RAD
+        gripper_close_rad = (
+            2048 - gripper_close_target_raw
+        ) * RAW_STEP_RAD
+        steps = steps_from_phases(
+            phases,
+            gripper_open_rad=gripper_open_rad,
+            gripper_close_rad=gripper_close_rad,
+        )
+        _, selected_joints, _ = arm_contract(side)
+        height_adjustment = (
+            {
+                "baseline_grasp_offset_m": BASELINE_PICK_GRASP_OFFSET_M,
+                "previous_grasp_offset_m": PREVIOUS_PICK_GRASP_OFFSET_M,
+                "selected_grasp_offset_m": PICK_GRASP_OFFSET_M,
+                "downward_adjustment_m": PICK_GRASP_DOWNWARD_ADJUSTMENT_M,
+                "cumulative_downward_adjustment_m": (
+                    PICK_GRASP_CUMULATIVE_DOWNWARD_ADJUSTMENT_M
+                ),
+                "reason": "operator_observed_run10_grasp_still_too_high",
+            }
+            if profile.name == "pen"
+            else {
+                "selected_grasp_offset_m": CAN_PICK_GRASP_OFFSET_M,
+                "object_center_height_source": "can_diameter_divided_by_two",
+                "can_diameter_m": CAN_DIAMETER_M,
+                "reason": "approach_the_centerline_of_the_lying_can_body",
+            }
+        )
+        document = {
+            "schema_version": 17 if profile.name == "can" else 12,
+            "status": (
+                "DYNAMIC_TOP_CAN_PICK_PLAN_ONLY_PASS"
+                if profile.name == "can"
+                else STATUS
+            ),
+            "generated_at_unix_s": time.time(),
+            "execution_api_used": False,
+            "motion_authorized": False,
+            "automatic_execution_permitted": False,
+            "source": "fresh_top_camera_target",
+            "object_profile": profile.name,
+            "task": args.task,
+            "target_topic": args.target_topic,
+            "object_geometry": (
+                {
+                    "state": "lying",
+                    "length_m": CAN_LENGTH_M,
+                    "diameter_m": CAN_DIAMETER_M,
+                    "mass_kg": CAN_MASS_KG,
+                    "grasp_strategy": (
+                        "close_across_body_perpendicular_to_long_axis"
+                    ),
+                }
+                if profile.name == "can"
+                else None
+            ),
+            "terminal_behavior": (
+                "bounded_hold_at_pick_lift_release_required_within_5s"
+                if profile.name == "can" and args.task == "pick-only"
+                else "hold_object_at_pick_lift_with_gripper_closed"
+                if args.task == "pick-only"
+                else "return_selected_arm_to_q0"
+            ),
+            "execution_support": {
+                "supported_by_existing_runner": (
+                    (profile.name == "pen" and args.task == "pick-place")
+                    or (profile.name == "can" and args.task == "pick-only")
+                ),
+                "runner": (
+                    "tools/run_top_can_pick_once.py"
+                    if profile.name == "can"
+                    else "tools/run_top_pick_place_application_once.py"
+                ),
+                "reason": (
+                    "supervised can execution requires an exact plan hash and "
+                    "operator confirmation; lift, replace, and release are "
+                    "bounded by the five-second unmonitored contact-hold limit"
+                    if profile.name == "can"
+                    else "legacy pen runner contract"
+                ),
+            },
+            "routing": {
+                "rule": "source_image_center_x",
+                "selected_arm": side,
+                "center_x_px": center_x_px,
+                "center_y_px": center_y_px,
+                "image_width_px": image_width_px,
+                "image_height_px": image_height_px,
+                "deadband_px": args.routing_deadband_px,
+                "nonselected_arm_behavior": (
+                    "hold_current_pose"
+                    if profile.name == "can"
+                    else "hold_bimanual_q0"
+                ),
+            },
+            "planning_frame": WORKCELL_FRAME,
+            "robot_description": {
+                "path": str(dual_urdf_path()),
+                "sha256": sha256_file(dual_urdf_path()),
+                "environment": DUAL_URDF_ENVIRONMENT,
+            },
+            "joint_names": list(selected_joints),
+            "q0_rad": list(Q0),
+            "target_lock": {
+                "x_m": x,
+                "y_m": y,
+                "z_m": z,
+                "yaw_rad": yaw,
+                "sample_count": locked.sample_count,
+                "minimum_confidence": locked.minimum_confidence,
+                "maximum_position_spread_m": (
+                    locked.maximum_position_spread_m
+                ),
+            },
+            "lateral_adjustment": lateral_adjustment,
+            "pick_offsets_m": {
+                "pregrasp": profile.pregrasp_offset_m,
+                "grasp": profile.grasp_offset_m,
+                "lift": profile.lift_offset_m,
+            },
+            "height_adjustment": height_adjustment,
+            "gripper_contract": {
+                "preopen_required": True,
+                "commissioned_gripper_sides": (
+                    ["left"] if profile.name == "can" else ["left", "right"]
+                ),
+                "open_target_raw": gripper_open_target_raw,
+                "open_target_rad": gripper_open_rad,
+                "open_phase": "before_approach",
+                "close_target_raw": gripper_close_target_raw,
+                "close_target_rad": gripper_close_rad,
+                "measured_grasp_width_m": (
+                    CAN_GRASP_WIDTH_M if profile.name == "can" else None
+                ),
+                "raw_width_mapping_inferred": False,
+                "contact_threshold_raw": CONTACT_THRESHOLD_RAW,
+                "open_observed_residual_raw": (
+                    6 if profile.name == "can" else None
+                ),
+                "held_object_observed_residual_raw": (
+                    None if profile.name == "can" else 8
+                ),
+                "expected_held_residual_raw_range": (
+                    [CAN_CONTACT_RESIDUAL_RAW_MIN, CAN_CONTACT_RESIDUAL_RAW_MAX]
+                    if profile.name == "can"
+                    else None
+                ),
+                "automatic_retry_count": 0,
+                "continuous_load_current_monitoring_available": False,
+                "maximum_unmonitored_contact_hold_s": (
+                    CAN_MAXIMUM_UNMONITORED_CONTACT_HOLD_S
+                    if profile.name == "can"
+                    else None
+                ),
+                "release_on_hold_timeout_required": profile.name == "can",
+                "firmware_position_or_torque_limits_modified": False,
+            },
+            "place_target_source": place_source,
+            "calibration": {
+                "path": str(args.calibration),
+                "sha256": sha256_file(args.calibration),
+            },
+            "operational_limits": {
+                "path": str(OPERATIONAL_LIMITS),
+                "sha256": sha256_file(OPERATIONAL_LIMITS),
+            },
+            "endpoints": endpoints,
+            "phases": phases,
+            "steps": steps,
+            "arm_segment_count": sum(
+                step["kind"] == "arm" for step in steps
+            ),
+            "command_step_count": len(steps),
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        digest = sha256(args.output.read_bytes()).hexdigest()
+        wrist_endpoint_rad = [
+            endpoints[name]["final_joint_positions_rad"][4]
+            for name in target_specs
+        ]
+        wrist_references = [0.0] + wrist_endpoint_rad[:-1]
+        wrist_delta_max = max(
+            abs(target - reference)
+            for target, reference in zip(
+                wrist_endpoint_rad, wrist_references, strict=True
+            )
+        )
+        print(
+            "DYNAMIC_PICK_WRIST_BRANCH_PASS "
+            f"policy={'solve_can_crossing_yaw' if profile.enforce_grasp_yaw else 'hold_bimanual_q0'} "
+            f"endpoint_rad={[round(value, 6) for value in wrist_endpoint_rad]} "
+            f"maximum_delta_rad={wrist_delta_max:.6f}"
+        )
+        if profile.name == "pen":
+            print(
+                "DYNAMIC_PICK_HEIGHT_OFFSET_PASS "
+                f"baseline_offset_m={BASELINE_PICK_GRASP_OFFSET_M:.6f} "
+                f"previous_offset_m={PREVIOUS_PICK_GRASP_OFFSET_M:.6f} "
+                f"selected_offset_m={PICK_GRASP_OFFSET_M:.6f} "
+                f"downward_adjustment_m={PICK_GRASP_DOWNWARD_ADJUSTMENT_M:.6f} "
+                f"cumulative_downward_adjustment_m={PICK_GRASP_CUMULATIVE_DOWNWARD_ADJUSTMENT_M:.6f} "
+                f"grasp_target_z_m={z + PICK_GRASP_OFFSET_M:.6f}"
+            )
+        else:
+            print(
+                "DYNAMIC_CAN_PICK_HEIGHT_PASS "
+                f"diameter_m={CAN_DIAMETER_M:.6f} "
+                f"center_height_m={CAN_DIAMETER_M / 2.0:.6f} "
+                f"grasp_target_z_m={z + CAN_PICK_GRASP_OFFSET_M:.6f}"
+            )
+        if args.task == "pick-place":
+            print(
+                "DYNAMIC_INTERARM_PLACE_MODE "
+                f"enabled={str(args.interarm_place).lower()} "
+                f"place_xy=({place['grasp'][0]:.6f},{place['grasp'][1]:.6f}) "
+                f"expected_next_arm={place_source.get('expected_next_selected_arm', 'none')}"
+            )
+        expected_held_residual = (
+            f"{CAN_CONTACT_RESIDUAL_RAW_MIN}..{CAN_CONTACT_RESIDUAL_RAW_MAX}"
+            if profile.name == "can"
+            else "8"
+        )
+        print(
+            "DYNAMIC_PICK_GRIPPER_CONTRACT_PASS "
+            f"open_target_raw={gripper_open_target_raw} "
+            f"close_target_raw={gripper_close_target_raw} "
+            f"close_target_rad={gripper_close_rad:.6f} "
+            f"contact_threshold_raw={CONTACT_THRESHOLD_RAW} "
+            f"expected_held_residual_raw={expected_held_residual}"
+        )
+        print(
+            f"{document['status']} selected_arm={side} "
+            f"pixel_x={center_x_px:.1f}/{image_width_px} "
+            f"target=({x:.6f},{y:.6f},{z:.6f}) "
+            f"arm_segments={document['arm_segment_count']} "
+            f"steps={len(steps)} output={args.output} sha256={digest}"
+        )
+        return 0
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

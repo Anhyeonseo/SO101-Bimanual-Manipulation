@@ -21,7 +21,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 for source_path in (
-    ROOT / "tools",
+    ROOT / "tools" / "run",
+    ROOT / "tools" / "lib",
     ROOT / "ros2_ws" / "src" / "single_arm_bridge",
 ):
     if str(source_path) not in sys.path:
